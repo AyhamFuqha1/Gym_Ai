@@ -10,9 +10,12 @@ import pymysql
 import chromadb
 import time
 import json
+import traceback
 from dotenv import load_dotenv
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from config import settings
+import re
+import copy
 
 load_dotenv()
 
@@ -28,10 +31,11 @@ embeddings = GoogleGenerativeAIEmbeddings(
 # 🗄️ MYSQL CONFIG
 # =====================
 DB_CONFIG = {
-    "host": "localhost",
-    "user": "root",
-    "password": "",
-    "database": "gym",
+    "host": os.getenv("DB_HOST", "127.0.0.1"),
+    "port": int(os.getenv("DB_PORT", 3306)),
+    "user": os.getenv("DB_USERNAME", "root"),
+    "password": os.getenv("DB_PASSWORD", ""),
+    "database": os.getenv("DB_DATABASE", "gym"),
 }
 
 # =====================
@@ -528,173 +532,445 @@ class SmartModifyNutritionRequest(BaseModel):
 # =====================
 # 🔧 SMART MODIFY FUNCTIONS
 # =====================
-def analyze_plan_and_suggest_modifications(current_plan, user_feedback, search_func):
-    modified_plan = current_plan.copy()
-    changes_summary = []
-    recommendations = []
-    
-    pain_areas = user_feedback.get('pain_areas', [])
-    difficulty = user_feedback.get('difficulty', '')
-    disliked_exercises = user_feedback.get('disliked_exercises', [])
-    liked_exercises = user_feedback.get('liked_exercises', [])
-    
-    search_queries = []
-    
-    if pain_areas:
-        for pain in pain_areas:
-            search_queries.append(f"safe exercise for {pain} no pain alternative")
-    
-    if difficulty == "too_hard":
-        search_queries.append("beginner easier exercise")
-    elif difficulty == "too_easy":
-        search_queries.append("advanced challenging exercise")
-    
-    if not search_queries:
-        search_queries.append("standard alternative exercise")
-    
-    suggested_exercises = []
-    for query in search_queries[:3]:
-        results = search_func(query, n_results=10)
-        for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
-            if meta["id"] not in [e.get("exercise_id") for e in suggested_exercises]:
-                suggested_exercises.append({
-                    "id": meta["id"],
-                    "name": meta["name"],
-                    "muscle_group": meta.get("muscle_group", ""),
-                    "difficulty": meta.get("difficulty", "intermediate")
-                })
-    
-    if "schedule" in modified_plan.get("plan_data", {}):
-        for day_idx, day in enumerate(modified_plan["plan_data"]["schedule"]):
-            for exercise_idx, exercise in enumerate(day.get("exercises", [])):
-                exercise_id = exercise.get("exercise_id")
-                
-                if exercise_id in disliked_exercises:
-                    if suggested_exercises:
-                        new_exercise = suggested_exercises.pop(0)
-                        old_name = exercise.get("name", "Unknown")
-                        exercise.update({
-                            "exercise_id": new_exercise["id"],
-                            "name": new_exercise["name"],
-                            "muscle_group": new_exercise["muscle_group"],
-                            "difficulty": new_exercise["difficulty"]
-                        })
-                        changes_summary.append(f"Replaced '{old_name}' with '{new_exercise['name']}'")
-                
-                if difficulty == "too_hard":
-                    if exercise.get("sets", 3) > 3:
-                        exercise["sets"] = max(2, exercise.get("sets", 3) - 1)
-                        changes_summary.append(f"Reduced sets for {exercise.get('name')}")
-                elif difficulty == "too_easy":
-                    if exercise.get("sets", 3) < 5:
-                        exercise["sets"] = exercise.get("sets", 3) + 1
-                        changes_summary.append(f"Increased sets for {exercise.get('name')}")
-    
-    if pain_areas:
-        recommendations.append(f"Avoid exercises that strain the {', '.join(pain_areas)}. Focus on proper form.")
-    if difficulty == "too_hard":
-        recommendations.append("Consider reducing weight or taking longer rest periods between sets.")
-    elif difficulty == "too_easy":
-        recommendations.append("Try increasing weight gradually or adding more volume.")
-    
-    recommendations.append("Focus on mind-muscle connection and proper form.")
-    
-    return {
-        "plan_id": current_plan.get("plan_id", "unknown"),
-       "version": int(current_plan.get("version", 1)) + 1,
-        "changes_summary": changes_summary[:10],
-        "modified_plan": modified_plan,
-        "recommendations": recommendations[:5]
+
+def extract_requested_split(modification_text: str):
+    if not modification_text:
+        return []
+
+    text = modification_text.strip()
+    text = re.sub(r"\s+", " ", text)
+
+    # خذ فقط جزء الـ Day split، بدون سحب الملاحظات اللاحقة داخل آخر يوم
+    matches = re.findall(
+        r"day\s*(\d+)\s*[:\-]?\s*(.*?)(?=\s*day\s*\d+\s*[:\-]?|$)",
+        text,
+        re.IGNORECASE,
+    )
+
+    parsed = []
+    for day_num, raw_focus in matches:
+        focus = raw_focus.strip(" .,-")
+        # قص أي جملة ملاحظات بعد اسم العضلات
+        focus = re.split(
+            r"\.\s+|,\s*(?:avoid|keep|make|please|reduce|easier|harder)\b|\bavoid\b|\bkeep\b",
+            focus,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip(" .,-")
+
+        if focus:
+            parsed.append({
+                "day": int(day_num),
+                "focus": focus
+            })
+
+    parsed.sort(key=lambda x: x["day"])
+    return parsed
+
+
+def normalize_focus_label(focus: str):
+    f = str(focus or "").lower().strip()
+
+    replacements = {
+        "&": " and ",
+        "/": " ",
+        "-": " ",
+        "_": " ",
+    }
+    for old, new in replacements.items():
+        f = f.replace(old, new)
+
+    f = re.sub(r"\s+", " ", f).strip()
+
+    aliases = {
+        "bi": "biceps",
+        "tri": "triceps",
+        "bi and tri": "biceps and triceps",
+        "biceps triceps": "biceps and triceps",
+        "arms": "biceps and triceps",
+        "upper body": "upper",
+        "lower body": "lower",
+        "push day": "push",
+        "pull day": "pull",
+        "leg day": "legs",
+        "shoulder day": "shoulders",
+        "back day": "back",
+        "chest day": "chest",
+        "full body day": "full body",
     }
 
-def analyze_nutrition_and_suggest_modifications(current_plan, user_feedback, search_func):
-    modified_plan = current_plan.copy()
+    return aliases.get(f, f)
+
+
+def get_focus_keywords(focus: str):
+    focus = normalize_focus_label(focus)
+
+    keyword_map = {
+        "chest": ["chest", "press", "fly", "pec"],
+        "back": ["back", "row", "pulldown", "pull up", "lat"],
+        "shoulders": ["shoulder", "lateral raise", "rear delt", "face pull"],
+        "legs": ["leg", "squat", "lunge", "leg press", "leg curl", "hamstring", "quad", "calf"],
+        "biceps": ["bicep", "curl"],
+        "triceps": ["tricep", "pushdown", "extension", "kickback"],
+        "biceps and triceps": ["bicep", "curl", "tricep", "pushdown", "extension", "kickback"],
+        "push": ["chest", "press", "fly", "pec", "tricep", "pushdown", "extension"],
+        "pull": ["back", "row", "pulldown", "lat", "bicep", "curl", "face pull"],
+        "upper": ["chest", "press", "fly", "back", "row", "pulldown", "shoulder", "raise", "bicep", "curl", "tricep"],
+        "lower": ["leg", "squat", "lunge", "leg press", "leg curl", "hamstring", "quad", "calf"],
+        "full body": ["chest", "row", "leg", "core"],
+        "core": ["plank", "dead bug", "crunch", "core", "ab", "mountain climber"],
+        "chest and triceps": ["chest", "press", "fly", "pec", "tricep", "pushdown", "extension"],
+        "back and biceps": ["back", "row", "pulldown", "lat", "bicep", "curl"],
+    }
+
+    if focus in keyword_map:
+        return keyword_map[focus]
+
+    parts = re.split(r"\band\b|,|\/", focus)
+    parts = [normalize_focus_label(p.strip()) for p in parts if p.strip()]
+
+    keywords = []
+    for p in parts:
+        if p in keyword_map:
+            keywords.extend(keyword_map[p])
+        else:
+            keywords.append(p)
+
+    deduped = []
+    seen = set()
+    for k in keywords:
+        if k not in seen:
+            seen.add(k)
+            deduped.append(k)
+
+    return deduped
+
+
+def exercise_matches_focus(ex_name: str, focus: str):
+    name = str(ex_name or "").lower().strip()
+    keywords = get_focus_keywords(focus)
+    return any(k in name for k in keywords)
+
+
+def get_injury_blocked_keywords(pain_areas: list):
+    injury_map = {
+        "elbow": [
+            "curl", "pushdown", "kickback", "skull crusher", "overhead extension",
+            "close grip", "reverse grip", "arnold press", "shoulder press",
+            "barbell curl", "ez bar curl", "concentration curl", "hammer curl",
+            "cable bicep curl", "dumbbell bicep curl", "tricep", "dip", "push up"
+        ],
+        "shoulder": [
+            "shoulder press", "arnold press", "upright row", "front raise",
+            "bench press", "incline press", "pec deck", "fly", "push up"
+        ],
+        "knee": [
+            "leg extension", "walking lunge", "jump squat", "bulgarian",
+            "step up", "box step up", "deep squat"
+        ],
+        "lower back": [
+            "romanian deadlift", "deadlift", "good morning", "bent over row"
+        ],
+        "back": [
+            "romanian deadlift", "deadlift", "good morning", "bent over row"
+        ],
+        "wrist": [
+            "barbell curl", "straight bar", "bench press", "push up"
+        ],
+    }
+
+    blocked = set()
+    for pain in pain_areas:
+        pain_l = str(pain).strip().lower()
+        for key, values in injury_map.items():
+            if key in pain_l:
+                blocked.update(v.lower() for v in values)
+
+    return blocked
+
+
+def build_queries_for_focus_dynamic(focus: str, pain_areas: list, difficulty: str, liked_exercises: list):
+    normalized_focus = normalize_focus_label(focus)
+    queries = []
+
+    queries.append(f"{normalized_focus} exercise")
+
+    if pain_areas:
+        for pain in pain_areas:
+            pain_l = str(pain).lower().strip()
+            queries.append(f"safe {normalized_focus} exercise for {pain_l}")
+            queries.append(f"{pain_l} friendly {normalized_focus} exercise")
+
+    if difficulty == "too_hard":
+        queries.append(f"beginner {normalized_focus} exercise")
+        queries.append(f"easy {normalized_focus} exercise")
+    elif difficulty == "too_easy":
+        queries.append(f"advanced {normalized_focus} exercise")
+        queries.append(f"challenging {normalized_focus} exercise")
+
+    for liked in liked_exercises:
+        liked_l = liked.lower().strip()
+        if any(k in liked_l for k in get_focus_keywords(normalized_focus)):
+            queries.append(liked)
+
+    final_queries = []
+    seen = set()
+    for q in queries:
+        q = q.strip()
+        if q and q not in seen:
+            seen.add(q)
+            final_queries.append(q)
+
+    return final_queries[:10]
+
+
+def collect_suggested_exercises(
+    focus: str,
+    search_queries,
+    search_func,
+    blocked_keywords=None,
+    excluded_ids=None,
+    excluded_names=None,
+    target_count: int = 4,
+):
+    blocked_keywords = blocked_keywords or set()
+    excluded_ids = excluded_ids or set()
+    excluded_names = excluded_names or set()
+
+    suggested = []
+    seen_ids = set()
+    seen_names = set()
+
+    def matches_blocked(name: str) -> bool:
+        name_l = str(name or "").strip().lower()
+        return any(word in name_l for word in blocked_keywords)
+
+    for query in search_queries:
+        results = search_func(query, n_results=15)
+        docs = results.get("documents", [[]])
+        metas = results.get("metadatas", [[]])
+
+        if not docs or not metas:
+            continue
+
+        for _, meta in zip(docs[0], metas[0]):
+            ex_id = meta.get("id")
+            ex_name = str(meta.get("name", "")).strip()
+            ex_name_l = ex_name.lower()
+
+            if not ex_id or not ex_name:
+                continue
+            if ex_id in seen_ids or ex_id in excluded_ids:
+                continue
+            if ex_name_l in seen_names or ex_name_l in excluded_names:
+                continue
+            if matches_blocked(ex_name):
+                continue
+            if not exercise_matches_focus(ex_name, focus):
+                continue
+            print("DEBUG_MIXED_FOCUS", focus, ex_name, exercise_matches_focus(ex_name, focus))
+
+            suggested.append({
+                "id": ex_id,
+                "name": ex_name,
+                "muscle_group": meta.get("muscle_group", "General"),
+                "difficulty": meta.get("difficulty", "beginner")
+            })
+
+            seen_ids.add(ex_id)
+            seen_names.add(ex_name_l)
+
+            if len(suggested) >= target_count:
+                return suggested
+
+    return suggested
+
+
+def build_new_schedule_from_split(split_days, user_feedback, search_func, current_plan):
+    pain_areas = [str(x).strip() for x in user_feedback.get("pain_areas", [])]
+    difficulty = user_feedback.get("difficulty", "")
+    liked_exercises = [str(x).strip() for x in user_feedback.get("liked_exercises", [])]
+    disliked_exercises = [str(x).strip().lower() for x in user_feedback.get("disliked_exercises", [])]
+    blocked_keywords = get_injury_blocked_keywords(pain_areas)
+
+    current_ids = set()
+    current_names = set()
+
+    for day in current_plan.get("plan_data", {}).get("schedule", []):
+        for ex in day.get("exercises", []):
+            if ex.get("exercise_id") is not None:
+                current_ids.add(ex["exercise_id"])
+            if ex.get("name"):
+                current_names.add(str(ex["name"]).strip().lower())
+
+    new_schedule = []
+    changes_summary = []
+
+    for item in split_days:
+        day_number = item["day"]
+        focus = normalize_focus_label(item["focus"])
+
+        queries = build_queries_for_focus_dynamic(
+            focus=focus,
+            pain_areas=pain_areas,
+            difficulty=difficulty,
+            liked_exercises=liked_exercises
+        )
+
+        suggestions = collect_suggested_exercises(
+            focus=focus,
+            search_queries=queries,
+            search_func=search_func,
+            blocked_keywords=blocked_keywords,
+            excluded_ids=current_ids,
+            excluded_names=current_names,
+            target_count=4
+        )
+
+        # fallback خاص إذا اليوم مختلط مثل biceps and triceps    
+        if len(suggestions) < 4 and focus in ["biceps and triceps", "chest and triceps", "back and biceps", "full body"]:
+            parts = []
+            if focus == "biceps and triceps":
+                parts = ["biceps", "triceps"]
+            elif focus == "chest and triceps":
+                parts = ["chest", "triceps"]
+            elif focus == "back and biceps":
+                parts = ["back", "biceps"]
+            elif focus == "full body":
+                parts = ["chest", "back", "legs", "core"]
+
+            mixed = []
+            for part in parts:
+                part_queries = build_queries_for_focus_dynamic(
+                    focus=part,
+                    pain_areas=pain_areas,
+                    difficulty=difficulty,
+                    liked_exercises=liked_exercises
+                )
+                part_suggestions = collect_suggested_exercises(
+                    focus=part,
+                    search_queries=part_queries,
+                    search_func=search_func,
+                    blocked_keywords=blocked_keywords,
+                    excluded_ids=current_ids,
+                    excluded_names=current_names,
+                    target_count=2 if focus != "full body" else 1
+                )
+                mixed.extend(part_suggestions)
+
+            deduped = []
+            seen_local_ids = set()
+            for ex in mixed:
+                ex_name = str(ex.get("name", "")).strip()
+                if ex["id"] in seen_local_ids:
+                    continue
+                if not exercise_matches_focus(ex_name, focus):
+                    continue
+                seen_local_ids.add(ex["id"])
+                deduped.append(ex)
+
+            suggestions = deduped[:4]
+
+        day_exercises = []
+        for suggestion in suggestions[:4]:
+            exercise_data = {
+                "exercise_id": suggestion["id"],
+                "name": suggestion["name"],
+                "muscle_group": suggestion["muscle_group"],
+                "difficulty": suggestion["difficulty"],
+                "sets": 2 if difficulty == "too_hard" else 3,
+                "reps": "12-15" if difficulty == "too_hard" else "8-12",
+                "rest_seconds": 90
+            }
+            day_exercises.append(exercise_data)
+            current_ids.add(suggestion["id"])
+            current_names.add(suggestion["name"].strip().lower())
+
+        if day_exercises:
+            new_schedule.append({
+                "day": day_number,
+                "focus": focus.title(),
+                "exercises": day_exercises
+            })
+            changes_summary.append(f"Built day {day_number} as {focus.title()} workout")
+
+    new_schedule.sort(key=lambda x: x["day"])
+    return new_schedule, changes_summary
+
+
+def analyze_plan_and_suggest_modifications(current_plan, user_feedback, search_func):
+    modified_plan = copy.deepcopy(current_plan)
     changes_summary = []
     recommendations = []
-    
-    feedback = user_feedback
-    current_macros = current_plan.get("total_daily", {})
-    current_calories = current_macros.get("calories", 2000)
-    
-    search_queries = []
-    
-    if feedback.get("satiety") == "hungry_between_meals":
-        search_queries.append("high protein high fiber filling snack")
-        recommendations.append("Add protein-rich snacks between meals to stay full longer")
-    
-    if feedback.get("digestion_issues"):
-        search_queries.append("easy digest light meal low fat")
-        recommendations.append("Avoid heavy fried foods, eat smaller portions more frequently")
-    
-    if feedback.get("goal") == "muscle_gain":
-        if current_macros.get("protein", 0) < 1.6 * 80:
-            search_queries.append("high protein food for muscle building")
-            recommendations.append("Increase protein intake to support muscle growth")
-    
-    if feedback.get("goal") == "fat_loss":
-        if current_calories > 2000:
-            search_queries.append("low calorie filling food")
-            recommendations.append("Consider reducing calorie intake or increasing activity")
-    
-    if not search_queries:
-        search_queries.append("healthy balanced meal")
-    
-    suggested_foods = []
-    for query in search_queries[:3]:
-        results = search_func(query, n_results=5)
-        for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
-            if meta["id"] not in [f.get("food_id") for f in suggested_foods]:
-                suggested_foods.append({
-                    "food_id": meta["id"],
-                    "name": meta["name"],
-                    "calories": meta["calories"],
-                    "protein": meta["protein"],
-                    "carbs": meta["carbs"],
-                    "fat": meta["fat"]
-                })
-    
-    if "daily_meals" in modified_plan:
-        for meal_idx, meal in enumerate(modified_plan["daily_meals"]):
-            for item_idx, item in enumerate(meal.get("items", [])):
-                if suggested_foods and (feedback.get("satiety") or feedback.get("digestion_issues")):
-                    new_food = suggested_foods.pop(0)
-                    old_name = item.get("name", "Unknown")
-                    item.update({
-                        "food_id": new_food["food_id"],
-                        "name": new_food["name"],
-                        "calories": new_food["calories"],
-                        "protein": new_food["protein"],
-                        "carbs": new_food["carbs"],
-                        "fat": new_food["fat"]
-                    })
-                    changes_summary.append(f"Replaced '{old_name}' with '{new_food['name']}' in {meal.get('meal', 'meal')}")
-                    break
-    
-    total_calories = 0
-    total_protein = 0
-    total_carbs = 0
-    total_fat = 0
-    
-    for meal in modified_plan.get("daily_meals", []):
-        for item in meal.get("items", []):
-            total_calories += item.get("calories", 0)
-            total_protein += item.get("protein", 0)
-            total_carbs += item.get("carbs", 0)
-            total_fat += item.get("fat", 0)
-    
-    modified_plan["total_daily"] = {
-        "calories": total_calories,
-        "protein": total_protein,
-        "carbs": total_carbs,
-        "fat": total_fat
-    }
-    
+
+    pain_areas = [str(x).strip() for x in user_feedback.get("pain_areas", [])]
+    difficulty = user_feedback.get("difficulty", "")
+    disliked_exercises = [str(x).strip().lower() for x in user_feedback.get("disliked_exercises", [])]
+    liked_exercises = [str(x).strip() for x in user_feedback.get("liked_exercises", [])]
+    modification_request = str(user_feedback.get("modification_request", "")).strip()
+
+    requested_split = extract_requested_split(modification_request)
+
+    if requested_split:
+        new_schedule, split_changes = build_new_schedule_from_split(
+            split_days=requested_split,
+            user_feedback=user_feedback,
+            search_func=search_func,
+            current_plan=current_plan
+        )
+
+        if new_schedule:
+            if "plan_data" not in modified_plan:
+                modified_plan["plan_data"] = {}
+
+            modified_plan["plan_data"]["schedule"] = new_schedule
+            changes_summary.extend(split_changes)
+
+            if pain_areas:
+                recommendations.append(
+                    f"Avoid exercises that strain the {', '.join(pain_areas)} and use controlled motion."
+                )
+
+            if difficulty == "too_hard":
+                recommendations.append(
+                    "Reduce load, keep reps moderate to high, and avoid painful lockout."
+                )
+                recommendations.append(
+                    "Prefer machine or cable movements when available."
+                )
+            elif difficulty == "too_easy":
+                recommendations.append(
+                    "Use slightly more challenging movements or increase training volume gradually."
+                )
+
+            if liked_exercises:
+                recommendations.append(
+                    "Use the preferred exercise variations when they are pain-free and controlled."
+                )
+
+            if disliked_exercises:
+                recommendations.append(
+                    "Avoid disliked movements when safer or more suitable alternatives are available."
+                )
+
+            recommendations.append(
+                "Stop any movement that causes sharp pain and focus on proper form."
+            )
+
+            return {
+                "plan_id": current_plan.get("plan_id", "unknown"),
+                "version": int(current_plan.get("version", 1)) + 1,
+                "changes_summary": changes_summary[:20],
+                "modified_plan": modified_plan,
+                "recommendations": recommendations[:6]
+            }
+
     return {
         "plan_id": current_plan.get("plan_id", "unknown"),
-       "version": int(current_plan.get("version", 1)) + 1,
-        "changes_summary": changes_summary[:10],
+        "version": int(current_plan.get("version", 1)) + 1,
+        "changes_summary": ["No meaningful training split changes detected."],
         "modified_plan": modified_plan,
-        "recommendations": recommendations[:5]
+        "recommendations": ["Keep monitoring form, pain response, and weekly recovery."]
     }
 
 # =====================
@@ -727,6 +1003,7 @@ async def sync_all_data(full_sync: bool = Query(False)):
         result = sync_all(full_sync=full_sync)
         return {"status": "success", "stats": result}
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/search-exercises")
@@ -742,6 +1019,7 @@ async def search_exercises_api(query: str, n_results: int = 10):
             ]
         }
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/search-foods")
@@ -757,47 +1035,267 @@ async def search_foods_api(query: str, n_results: int = 10):
             ]
         }
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/generate-training-plan")
 async def generate_training_plan(request: GenerateTrainingRequest):
     try:
-        search_query = f"{request.user_summary.goal} {request.user_summary.level} workout"
-        if request.user_summary.weak_points:
-            search_query += f" focus on {', '.join(request.user_summary.weak_points)}"
-        
-        results = search_exercises(search_query, n_results=20)
-        
-        schedule = []
-        day_exercises = []
-        for i, (doc, meta) in enumerate(zip(results["documents"][0], results["metadatas"][0])):
-            day_exercises.append({
+        goal = str(request.user_summary.goal or "").strip().lower().replace(" ", "_")
+        level = str(request.user_summary.level or "beginner").strip().lower()
+        injuries = [str(x).strip().lower() for x in (request.user_summary.injuries or [])]
+        weak_points = [str(x).strip().lower() for x in (request.user_summary.weak_points or [])]
+
+        split_days = [
+            {"day": 1, "focus": "chest and triceps"},
+            {"day": 2, "focus": "back and biceps"},
+            {"day": 3, "focus": "shoulders"},
+            {"day": 4, "focus": "legs"},
+            {"day": 5, "focus": "full body"},
+        ]
+
+        focus_keyword_map = {
+            "chest and triceps": ["chest", "press", "fly", "pec", "tricep", "pushdown", "extension"],
+            "back and biceps": ["back", "row", "pulldown", "pull", "lat", "bicep", "curl"],
+            "shoulders": ["shoulder", "lateral raise", "rear delt", "face pull"],
+            "legs": ["leg", "squat", "press", "curl", "hamstring", "quad", "calf", "lunge"],
+            "core": ["plank", "dead bug", "crunch", "core", "ab", "knee raise", "mountain climber"],
+            "full body": ["chest", "row", "leg", "core"],
+        }
+
+        injury_block_map = {
+            "elbow": [
+                "curl", "pushdown", "kickback", "skull crusher", "overhead extension",
+                "close grip", "reverse grip", "arnold press", "shoulder press",
+                "barbell curl", "ez bar curl", "concentration curl", "hammer curl",
+                "cable bicep curl", "dumbbell bicep curl", "tricep", "dip", "push up"
+            ],
+            "shoulder": [
+                "shoulder press", "arnold press", "upright row", "front raise",
+                "bench press", "incline press", "pec deck", "fly", "push up"
+            ],
+            "knee": [
+                "leg extension", "walking lunge", "jump squat", "bulgarian",
+                "step up", "box step up", "deep squat"
+            ],
+            "lower back": [
+                "romanian deadlift", "deadlift", "good morning", "bent over row"
+            ],
+            "back": [
+                "romanian deadlift", "deadlift", "good morning", "bent over row"
+            ],
+            "wrist": [
+                "barbell curl", "straight bar", "bench press", "push up"
+            ],
+        }
+
+        blocked_keywords = set()
+        for injury in injuries:
+            for key, blocked_list in injury_block_map.items():
+                if key in injury:
+                    blocked_keywords.update(x.lower() for x in blocked_list)
+
+        sets_value = 2 if level == "beginner" else 3
+        reps_value = "12-15" if level == "beginner" else "8-12"
+
+        def matches_blocked(exercise_name: str) -> bool:
+            name_l = str(exercise_name or "").strip().lower()
+            return any(word in name_l for word in blocked_keywords)
+
+        def matches_focus(exercise_name: str, focus: str) -> bool:
+            name_l = str(exercise_name or "").strip().lower()
+            keywords = focus_keyword_map.get(focus.lower(), [focus.lower()])
+            return any(k in name_l for k in keywords)
+
+        def build_queries_for_focus_dynamic(focus: str):
+            queries = [f"{level} {focus} exercise"]
+
+            if goal in ["muscle_gain", "higher_protein"]:
+                queries.append(f"{focus} hypertrophy exercise")
+            elif goal in ["fat_loss", "lower_calories", "weight_loss"]:
+                queries.append(f"{focus} fat loss exercise")
+            else:
+                queries.append(f"{goal} {focus} exercise")
+
+            for point in weak_points[:3]:
+                queries.append(f"{focus} exercise for {point}")
+
+            for injury in injuries[:3]:
+                queries.append(f"safe {focus} exercise for {injury}")
+                queries.append(f"{injury} friendly {focus} exercise")
+
+            deduped = []
+            seen = set()
+            for q in queries:
+                q = q.strip().lower()
+                if q and q not in seen:
+                    seen.add(q)
+                    deduped.append(q)
+            return deduped[:10]
+
+        def make_exercise_item(meta):
+            return {
                 "exercise_id": meta["id"],
                 "name": meta["name"],
-                "muscle_group": meta["muscle_group"],
-                "difficulty": meta["difficulty"],
-                "sets": 3,
-                "reps": "8-12" if meta["difficulty"] == "beginner" else "8-10",
+                "muscle_group": meta.get("muscle_group", "General"),
+                "difficulty": meta.get("difficulty", level or "beginner"),
+                "sets": sets_value,
+                "reps": reps_value,
                 "rest_seconds": 90
-            })
-            if len(day_exercises) >= 6:
-                schedule.append({"day": len(schedule) + 1, "focus": "Workout", "exercises": day_exercises})
-                day_exercises = []
-        
-        if day_exercises:
-            schedule.append({"day": len(schedule) + 1, "focus": "Workout", "exercises": day_exercises})
-        
+            }
+
+        def search_and_collect(focus: str, used_ids: set, used_names: set, target_count: int = 4):
+            collected = []
+            queries = build_queries_for_focus_dynamic(focus)
+
+            for query in queries:
+                results = search_exercises(query, n_results=20)
+                docs = results.get("documents", [[]])
+                metas = results.get("metadatas", [[]])
+
+                if not docs or not metas:
+                    continue
+
+                for _, meta in zip(docs[0], metas[0]):
+                    ex_id = meta.get("id")
+                    ex_name = str(meta.get("name", "")).strip()
+                    ex_name_l = ex_name.lower()
+
+                    if not ex_id or not ex_name:
+                        continue
+                    if ex_id in used_ids or ex_name_l in used_names:
+                        continue
+                    if matches_blocked(ex_name):
+                        continue
+                    if not matches_focus(ex_name, focus):
+                        continue
+
+                    collected.append(make_exercise_item(meta))
+                    used_ids.add(ex_id)
+                    used_names.add(ex_name_l)
+
+                    if len(collected) >= target_count:
+                        return collected
+
+            fallback_queries = [
+                f"{focus} workout exercise",
+                f"beginner {focus} exercise",
+                f"safe {focus} exercise"
+            ]
+
+            for query in fallback_queries:
+                results = search_exercises(query, n_results=25)
+                docs = results.get("documents", [[]])
+                metas = results.get("metadatas", [[]])
+
+                if not docs or not metas:
+                    continue
+
+                for _, meta in zip(docs[0], metas[0]):
+                    ex_id = meta.get("id")
+                    ex_name = str(meta.get("name", "")).strip()
+                    ex_name_l = ex_name.lower()
+
+                    if not ex_id or not ex_name:
+                        continue
+                    if ex_id in used_ids or ex_name_l in used_names:
+                        continue
+                    if matches_blocked(ex_name):
+                        continue
+                    if not matches_focus(ex_name, focus):
+                        continue
+
+                    collected.append(make_exercise_item(meta))
+                    used_ids.add(ex_id)
+                    used_names.add(ex_name_l)
+
+                    if len(collected) >= target_count:
+                        return collected
+
+            return collected
+
+        def collect_full_body_exercises(used_ids: set, used_names: set):
+            collected = []
+            full_body_parts = ["chest and triceps", "back and biceps", "legs", "core"]
+
+            for part in full_body_parts:
+                exercises = search_and_collect(part, used_ids, used_names, target_count=1)
+                if exercises:
+                    collected.extend(exercises[:1])
+
+            if len(collected) < 4:
+                fallback_queries = [
+                    "beginner full body exercise",
+                    "safe full body workout exercise",
+                    "core exercise"
+                ]
+
+                for query in fallback_queries:
+                    results = search_exercises(query, n_results=20)
+                    docs = results.get("documents", [[]])
+                    metas = results.get("metadatas", [[]])
+
+                    if not docs or not metas:
+                        continue
+
+                    for _, meta in zip(docs[0], metas[0]):
+                        ex_id = meta.get("id")
+                        ex_name = str(meta.get("name", "")).strip()
+                        ex_name_l = ex_name.lower()
+
+                        if not ex_id or not ex_name:
+                            continue
+                        if ex_id in used_ids or ex_name_l in used_names:
+                            continue
+                        if matches_blocked(ex_name):
+                            continue
+
+                        collected.append(make_exercise_item(meta))
+                        used_ids.add(ex_id)
+                        used_names.add(ex_name_l)
+
+                        if len(collected) >= 4:
+                            return collected
+
+            return collected[:4]
+
+        used_ids = set()
+        used_names = set()
+        schedule = []
+
+        for split in split_days:
+            focus = split["focus"]
+
+            if focus == "full body":
+                day_exercises = collect_full_body_exercises(used_ids, used_names)
+            else:
+                day_exercises = search_and_collect(
+                    focus=focus,
+                    used_ids=used_ids,
+                    used_names=used_names,
+                    target_count=4
+                )
+
+            if day_exercises:
+                schedule.append({
+                    "day": split["day"],
+                    "focus": focus.title(),
+                    "exercises": day_exercises
+                })
+
         return {
             "plan_id": f"plan_{request.user_summary.user_id}_{int(datetime.now().timestamp())}",
             "version": 1,
             "generated_at": datetime.now().isoformat(),
             "plan_data": {
                 "duration_weeks": 4,
-                "schedule": schedule[:5]
+                "schedule": schedule
             }
         }
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))  
 
 @app.post("/modify-training-plan")
 async def modify_training_plan(request: SmartModifyTrainingRequest):
@@ -805,41 +1303,243 @@ async def modify_training_plan(request: SmartModifyTrainingRequest):
         result = analyze_plan_and_suggest_modifications(
             current_plan=request.current_plan,
             user_feedback=request.user_feedback,
-           search_func=search_exercises
+            search_func=search_exercises
         )
         return result
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def normalize_term(value: str) -> str:
+    if not value:
+        return ""
+    value = str(value).strip().lower()
+    value = re.sub(r"[_\-]+", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
+FOOD_CATEGORY_MAP = {
+    "seafood": ["fish", "tuna", "salmon", "shrimp", "cod", "sardine", "mackerel", "seafood"],
+    "fish": ["fish", "tuna", "salmon", "shrimp", "cod", "sardine", "mackerel"],
+    "nuts": ["peanut", "peanut butter", "almond", "walnut", "cashew", "pistachio", "hazelnut", "nuts"],
+    "dairy": ["milk", "yogurt", "greek yogurt", "cheese", "labneh", "cream", "dairy"],
+    "red meat": ["beef", "lean beef", "lamb", "red meat"],
+    "bread": ["bread", "toast", "bun"],
+    "eggs": ["egg", "eggs", "boiled egg"],
+    "chicken": ["chicken", "grilled chicken breast"],
+    "turkey": ["turkey", "turkey breast"],
+}
+
+
+def expand_blocked_terms(raw_terms):
+    expanded = set()
+
+    for term in raw_terms:
+        term = normalize_term(term)
+        if not term:
+            continue
+
+        expanded.add(term)
+
+        if term.endswith("s") and len(term) > 3:
+            expanded.add(term[:-1])
+        else:
+            expanded.add(term + "s")
+
+        if term in FOOD_CATEGORY_MAP:
+            for alias in FOOD_CATEGORY_MAP[term]:
+                expanded.add(normalize_term(alias))
+
+    return expanded
+
+
+def collect_blocked_terms(preferences: dict):
+    raw_terms = []
+
+    for item in preferences.get("disliked_foods", []) or []:
+        raw_terms.append(str(item))
+
+    for key in ["food_allergies", "medical_conditions", "preferences"]:
+        text = str(preferences.get(key) or "")
+        if text:
+            parts = re.split(r"[,\n/]+", text)
+            raw_terms.extend(parts)
+
+    return expand_blocked_terms(raw_terms)
+
+
+def food_matches_restrictions(food_name: str, blocked_terms):
+    name = normalize_term(food_name)
+    if not name:
+        return False
+
+    if name in blocked_terms:
+        return True
+
+    for term in blocked_terms:
+        if not term:
+            continue
+        if term in name or name in term:
+            return True
+
+    return False
+
 
 @app.post("/generate-nutrition-plan")
 async def generate_nutrition_plan(request: GenerateNutritionRequest):
     try:
-        search_query = f"{request.user_summary.goal} healthy food"
-        if request.user_summary.goal == "muscle_gain":
-            search_query += " high protein"
-        elif request.user_summary.goal == "fat_loss":
-            search_query += " low calorie"
-        
-        results = search_nutrition(search_query, n_results=15)
-        
+        goal = normalize_term(request.user_summary.goal or "").replace(" ", "_")
+        preferences = request.preferences or {}
+
+        blocked_terms = collect_blocked_terms(preferences)
+        liked_foods = [
+            normalize_term(x)
+            for x in (preferences.get("liked_foods", []) or [])
+            if normalize_term(x)
+        ]
+
+        if goal == "higher_protein":
+            blocked_terms.update(
+                expand_blocked_terms([
+                    "nuts",
+                    "almonds",
+                    "walnuts",
+                    "peanut",
+                    "peanut butter",
+                ])
+            )
+
+        queries = []
+
+        if goal == "muscle_gain":
+            queries.extend([
+                "high protein lean food",
+                "healthy muscle gain food",
+                "lean protein food"
+            ])
+        elif goal in ["fat_loss", "lower_calories", "weight_loss"]:
+            queries.extend([
+                "low calorie high protein food",
+                "healthy low calorie food",
+                "lean protein food"
+            ])
+        elif goal == "higher_protein":
+            queries.extend([
+                "high protein lean food",
+                "lean protein food",
+                "healthy protein rich food"
+            ])
+        else:
+            queries.extend([
+                f"{goal} healthy food" if goal else "healthy balanced food",
+                "healthy balanced food"
+            ])
+
+        for liked in liked_foods[:5]:
+            queries.append(liked)
+
+        suggested_foods = []
+        seen_ids = set()
+        seen_names = set()
+
+        for query in queries[:12]:
+            results = search_nutrition(query, n_results=20)
+            docs = results.get("documents", [[]])
+            metas = results.get("metadatas", [[]])
+
+            if not docs or not metas:
+                continue
+
+            for _, meta in zip(docs[0], metas[0]):
+                food_id = meta.get("id")
+                food_name = str(meta.get("name", "")).strip()
+                food_name_l = normalize_term(food_name)
+
+                if not food_id or not food_name:
+                    continue
+
+                if food_id in seen_ids or food_name_l in seen_names:
+                    continue
+
+                if food_matches_restrictions(food_name, blocked_terms):
+                    continue
+
+                calories = float(meta.get("calories", 0) or 0)
+                fat = float(meta.get("fat", 0) or 0)
+                protein = float(meta.get("protein", 0) or 0)
+                carbs = float(meta.get("carbs", 0) or 0)
+
+                if goal in ["fat_loss", "lower_calories", "weight_loss"]:
+                    if calories > 220:
+                        continue
+                    if fat > 10:
+                        continue
+
+                if goal == "muscle_gain":
+                    if protein < 8:
+                        continue
+
+                if goal == "higher_protein":
+                    if protein < 12:
+                        continue
+                    if fat > 12:
+                        continue
+                    if calories > 250:
+                        continue
+
+                suggested_foods.append({
+                    "food_id": food_id,
+                    "name": food_name,
+                    "calories": calories,
+                    "protein": protein,
+                    "carbs": carbs,
+                    "fat": fat,
+                    "quantity": 1
+                })
+
+                seen_ids.add(food_id)
+                seen_names.add(food_name_l)
+
         meals = {"breakfast": [], "lunch": [], "dinner": [], "snacks": []}
         categories = ["breakfast", "lunch", "dinner", "snacks"]
         cat_idx = 0
-        
-        for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
-            meals[categories[cat_idx % 4]].append({
-                "food_id": meta["id"],
-                "name": meta["name"],
-                "calories": meta["calories"],
-                "protein": meta["protein"],
-                "carbs": meta["carbs"],
-                "fat": meta["fat"],
-                "quantity": 1
-            })
+
+        for food in suggested_foods[:16]:
+            meals[categories[cat_idx % 4]].append(food)
             cat_idx += 1
-        
-        total_calories = sum(item["calories"] for meal in meals.values() for item in meal if "calories" in item)
-        
+
+        # final cleanup
+        for meal_name in meals:
+            cleaned_items = []
+            for item in meals[meal_name]:
+                item_name = item.get("name", "")
+                item_calories = float(item.get("calories", 0) or 0)
+                item_fat = float(item.get("fat", 0) or 0)
+                item_protein = float(item.get("protein", 0) or 0)
+
+                if food_matches_restrictions(item_name, blocked_terms):
+                    continue
+
+                if goal in ["fat_loss", "lower_calories", "weight_loss"]:
+                    if item_calories > 220 or item_fat > 10:
+                        continue
+
+                if goal == "higher_protein":
+                    if item_protein < 12:
+                        continue
+                    if item_fat > 12:
+                        continue
+                    if item_calories > 250:
+                        continue
+
+                cleaned_items.append(item)
+
+            meals[meal_name] = cleaned_items
+
+        total_calories = sum(item["calories"] for meal in meals.values() for item in meal)
+
         return {
             "plan_id": f"meal_{request.user_summary.user_id}_{int(datetime.now().timestamp())}",
             "version": 1,
@@ -858,7 +1558,255 @@ async def generate_nutrition_plan(request: GenerateNutritionRequest):
             }
         }
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def analyze_nutrition_and_suggest_modifications(current_plan, user_feedback, search_func):
+    modified_plan = copy.deepcopy(current_plan)
+    changes_summary = []
+    recommendations = []
+
+    disliked_foods = [str(x).strip() for x in user_feedback.get("disliked_foods", [])]
+    liked_foods = [normalize_term(x) for x in user_feedback.get("liked_foods", []) if normalize_term(x)]
+    blocked_terms = expand_blocked_terms(disliked_foods)
+
+    goal = normalize_term(user_feedback.get("goal", "")).replace(" ", "_")
+    recommendations.append(f"DEBUG_GOAL={goal}")
+    notes = normalize_term(user_feedback.get("notes", ""))
+
+    if goal == "higher_protein":
+        blocked_terms.update(
+            expand_blocked_terms([
+                "nuts",
+                "almonds",
+                "walnuts",
+                "peanut",
+                "peanut butter",
+            ])
+        )
+
+    normalized_meals = []
+    for meal in modified_plan.get("daily_meals", []):
+        meal_name = meal.get("meal") or meal.get("meal_type")
+        meal_items = meal.get("items", [])
+
+        if not meal_items and meal.get("foods"):
+            converted_items = []
+            for food in meal.get("foods", []):
+                converted_items.append({
+                    "food_id": food.get("food_id") or food.get("nutrition_id"),
+                    "name": food.get("name", ""),
+                    "calories": float(food.get("calories", 0) or 0),
+                    "protein": float(food.get("protein", 0) or 0),
+                    "carbs": float(food.get("carbs", 0) or 0),
+                    "fat": float(food.get("fat", 0) or 0),
+                    "quantity": food.get("quantity", 1),
+                })
+            meal_items = converted_items
+
+        normalized_meals.append({
+            "meal": meal_name,
+            "items": meal_items
+        })
+
+    modified_plan["daily_meals"] = normalized_meals
+
+    search_queries = []
+
+    if goal == "lower_calories":
+        search_queries.extend([
+            "low calorie high protein food",
+            "healthy low calorie food",
+            "lean protein food",
+        ])
+    elif goal == "higher_protein":
+        search_queries.extend([
+            "high protein lean food",
+            "lean protein food",
+            "healthy protein rich food",
+        ])
+    elif goal:
+        search_queries.append(f"{goal} healthy food")
+
+    for liked in liked_foods[:5]:
+        search_queries.append(liked)
+
+    if notes:
+        search_queries.append(notes)
+
+    if not search_queries:
+        search_queries.append("healthy balanced food")
+
+    suggested_foods = []
+    seen_ids = set()
+    seen_names = set()
+
+    for query in search_queries[:10]:
+        results = search_func(query, n_results=15)
+        docs = results.get("documents", [[]])
+        metas = results.get("metadatas", [[]])
+
+        if not docs or not metas:
+            continue
+
+        for _, meta in zip(docs[0], metas[0]):
+            food_id = meta.get("id")
+            food_name = str(meta.get("name", "")).strip()
+            food_name_l = normalize_term(food_name)
+
+            if not food_id or not food_name:
+                continue
+
+            if food_id in seen_ids or food_name_l in seen_names:
+                continue
+
+            if food_matches_restrictions(food_name, blocked_terms):
+                continue
+
+            calories = float(meta.get("calories", 0) or 0)
+            fat = float(meta.get("fat", 0) or 0)
+            protein = float(meta.get("protein", 0) or 0)
+
+            if goal == "lower_calories":
+                if calories > 220:
+                    continue
+                if fat > 10:
+                    continue
+
+            if goal == "higher_protein":
+                if protein < 12:
+                    continue
+                if fat > 12:
+                    continue
+                if calories > 250:
+                    continue
+
+            suggested_foods.append({
+                "food_id": food_id,
+                "name": food_name,
+                "calories": calories,
+                "protein": protein,
+                "carbs": float(meta.get("carbs", 0) or 0),
+                "fat": fat,
+                "quantity": 1
+            })
+
+            seen_ids.add(food_id)
+            seen_names.add(food_name_l)
+
+    used_names = set()
+    total_daily = {"calories": 0.0, "protein": 0.0, "carbs": 0.0, "fat": 0.0}
+
+    for meal in modified_plan.get("daily_meals", []):
+        meal_items = meal.get("items", [])
+
+        for i, item in enumerate(meal_items):
+            should_replace = False
+
+            if item.get("name") and food_matches_restrictions(item.get("name", ""), blocked_terms):
+                should_replace = True
+
+            if goal == "lower_calories":
+                try:
+                    if float(item.get("calories", 0) or 0) > 220:
+                        should_replace = True
+                    if float(item.get("fat", 0) or 0) > 10:
+                        should_replace = True
+                except Exception:
+                    pass
+
+            if goal == "higher_protein":
+                try:
+                    if float(item.get("protein", 0) or 0) < 12:
+                        should_replace = True
+                    if float(item.get("fat", 0) or 0) > 12:
+                        should_replace = True
+                    if float(item.get("calories", 0) or 0) > 250:
+                        should_replace = True
+                except Exception:
+                    pass
+
+            if should_replace:
+                replacement = None
+                for food in suggested_foods:
+                    candidate_name = normalize_term(food["name"])
+
+                    if candidate_name in used_names:
+                        continue
+
+                    if food_matches_restrictions(food["name"], blocked_terms):
+                        continue
+
+                    replacement = food
+                    break
+
+                if replacement:
+                    old_name = item.get("name", f"food_id {item.get('food_id', 'unknown')}")
+                    meal_items[i] = replacement
+                    used_names.add(normalize_term(replacement["name"]))
+                    changes_summary.append(f"Replaced '{old_name}' with '{replacement['name']}'")
+
+        meal["items"] = meal_items
+
+    # final cleanup pass
+    for meal in modified_plan.get("daily_meals", []):
+        cleaned_items = []
+
+        for item in meal.get("items", []):
+            item_name = item.get("name", "")
+            item_calories = float(item.get("calories", 0) or 0)
+            item_fat = float(item.get("fat", 0) or 0)
+            item_protein = float(item.get("protein", 0) or 0)
+
+            if food_matches_restrictions(item_name, blocked_terms):
+                continue
+
+            if goal == "lower_calories":
+                if item_calories > 220 or item_fat > 10:
+                    continue
+
+            if goal == "higher_protein":
+                if item_protein < 12:
+                    continue
+                if item_fat > 12:
+                    continue
+                if item_calories > 250:
+                    continue
+
+            cleaned_items.append(item)
+
+        meal["items"] = cleaned_items
+
+    for meal in modified_plan.get("daily_meals", []):
+        for item in meal.get("items", []):
+            quantity = float(item.get("quantity", 1) or 1)
+            total_daily["calories"] += float(item.get("calories", 0) or 0) * quantity
+            total_daily["protein"] += float(item.get("protein", 0) or 0) * quantity
+            total_daily["carbs"] += float(item.get("carbs", 0) or 0) * quantity
+            total_daily["fat"] += float(item.get("fat", 0) or 0) * quantity
+
+    modified_plan["total_daily"] = total_daily
+
+    if goal == "lower_calories":
+        recommendations.append("Prefer lower calorie meals with lean protein sources.")
+    if goal == "higher_protein":
+        recommendations.append("Increase lean protein sources while keeping calories and fats controlled.")
+    if disliked_foods:
+        recommendations.append("Removed or reduced disliked foods where alternatives were available.")
+    if notes:
+        recommendations.append("Applied the user's nutrition notes where possible.")
+
+    recommendations.append("FINAL_CLEANUP_OK")
+
+    return {
+        "plan_id": current_plan.get("plan_id", "unknown"),
+        "version": int(current_plan.get("version", 1)) + 1,
+        "changes_summary": changes_summary[:20],
+        "modified_plan": modified_plan,
+        "recommendations": recommendations[:6]
+    }
+
 
 @app.post("/modify-nutrition-plan")
 async def modify_nutrition_plan(request: SmartModifyNutritionRequest):
@@ -866,10 +1814,11 @@ async def modify_nutrition_plan(request: SmartModifyNutritionRequest):
         result = analyze_nutrition_and_suggest_modifications(
             current_plan=request.current_plan,
             user_feedback=request.user_feedback,
-          search_func=search_nutrition
+            search_func=search_nutrition
         )
-        return result 
+        return result
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/analyze-progress")
@@ -904,6 +1853,7 @@ async def analyze_progress(request: AnalyzeProgressRequest):
             "suggested_action": action
         }
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 # =====================
