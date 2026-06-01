@@ -15,9 +15,24 @@ import logging
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from config import settings
 from llm_client import call_llm_chat
-from prompt_builders import build_training_plan_prompt, build_nutrition_plan_prompt
-from rag_schemas import training_plan_response_schema, nutrition_plan_response_schema
-from response_parsers import parse_training_plan_response, parse_nutrition_plan_response
+from prompt_builders import (
+    build_modify_nutrition_plan_prompt,
+    build_modify_training_plan_prompt,
+    build_nutrition_plan_prompt,
+    build_training_plan_prompt,
+)
+from rag_schemas import (
+    modified_nutrition_plan_response_schema,
+    modified_training_plan_response_schema,
+    nutrition_plan_response_schema,
+    training_plan_response_schema,
+)
+from response_parsers import (
+    parse_modified_nutrition_plan_response,
+    parse_modified_training_plan_response,
+    parse_nutrition_plan_response,
+    parse_training_plan_response,
+)
 import re
 import copy
 
@@ -1177,16 +1192,20 @@ class SearchRequest(BaseModel):
     debug_context: Optional[bool] = False
 
 class SmartModifyTrainingRequest(BaseModel):
-    current_plan_id: str
+    current_plan_id: Optional[Union[int, str]] = None
     current_plan: Dict[str, Any]
     user_summary: UserSummary
     user_feedback: Dict[str, Any] = {}
+    modification_request: Optional[Union[Dict[str, Any], str]] = None
 
 class SmartModifyNutritionRequest(BaseModel):
-    current_plan_id: str
+    current_plan_id: Optional[Union[int, str]] = None
     current_plan: Dict[str, Any]
     user_summary: UserSummary
     user_feedback: Dict[str, Any] = {}
+    preferences: Dict[str, Any] = {}
+    target_macros: Optional[Dict[str, Any]] = None
+    modification_request: Optional[Union[Dict[str, Any], str]] = None
 
 # =====================
 # 🔧 SMART MODIFY FUNCTIONS
@@ -1321,7 +1340,8 @@ def get_injury_blocked_keywords(pain_areas: list):
         ],
         "shoulder": [
             "shoulder press", "arnold press", "upright row", "front raise",
-            "bench press", "incline press", "pec deck", "fly", "push up"
+            "lateral raise", "rear delt", "shoulder raise", "overhead press",
+            "military press", "face pull", "bench press", "incline press", "pec deck", "fly", "push up"
         ],
         "knee": [
             "leg extension", "walking lunge", "jump squat", "bulgarian",
@@ -2261,7 +2281,7 @@ def rag_debug_error_type(error: Exception):
         return error.category
     return safe_training_fallback_reason(error)
 
-def training_rag_response_to_legacy_response(rag_response, request: GenerateTrainingRequest):
+def training_rag_response_to_legacy_response(rag_response, request: GenerateTrainingRequest, retrieved_items=None):
     schedule = []
     for day in rag_response.days:
         exercises = []
@@ -2288,6 +2308,30 @@ def training_rag_response_to_legacy_response(rag_response, request: GenerateTrai
     if not any(day["exercises"] for day in schedule):
         raise ValueError("LLM response did not include usable exercises")
 
+    guard_changes, guard_warnings, _, guard_sources = (
+        apply_shoulder_safety_guard_to_modified_schedule(
+            schedule,
+            request,
+            {},
+            retrieved_items or [],
+        )
+    )
+    injury_warnings = unique_strings(
+        guard_warnings,
+        rag_response.injury_warnings,
+    )
+    used_source_ids = used_training_source_ids(schedule)
+    sources = [
+        model_to_plain_dict(source)
+        for source in rag_response.sources
+        if str(source.source_id) in used_source_ids
+    ]
+    existing_source_ids = {str(source.get("source_id")) for source in sources}
+    for source in guard_sources:
+        if str(source.get("source_id")) not in existing_source_ids:
+            sources.append(source)
+            existing_source_ids.add(str(source.get("source_id")))
+
     return {
         "status": rag_response.status,
         "plan_id": f"plan_{request.user_summary.user_id}_{int(datetime.now().timestamp())}",
@@ -2299,8 +2343,732 @@ def training_rag_response_to_legacy_response(rag_response, request: GenerateTrai
         },
         "generation_mode": "rag",
         "rag_summary": rag_response.summary,
-        "sources": [model_to_plain_dict(source) for source in rag_response.sources],
-        "injury_warnings": rag_response.injury_warnings,
+        "sources": sources,
+        "injury_warnings": injury_warnings,
+    }
+
+def training_plan_id_from_request(request: SmartModifyTrainingRequest):
+    return request.current_plan_id or request.current_plan.get("plan_id", "unknown")
+
+def next_training_plan_version(current_plan: Dict[str, Any]):
+    try:
+        return int(current_plan.get("version", 1)) + 1
+    except (TypeError, ValueError):
+        return 2
+
+def normalize_training_modification_text(value):
+    if value in [None, "", []]:
+        return ""
+    if isinstance(value, dict):
+        parts = []
+        for key in ["reason", "notes", "modification_request", "request", "message", "difficulty"]:
+            item = value.get(key)
+            if item not in [None, "", []]:
+                parts.append(f"{key}: {item}")
+        if parts:
+            return "; ".join(parts)
+        return json.dumps(value, ensure_ascii=False, default=str)
+    return str(value).strip()
+
+def resolve_training_modification_feedback(request: SmartModifyTrainingRequest):
+    feedback = model_to_plain_dict(request.user_feedback) if request.user_feedback else {}
+    root_modification = request.modification_request
+
+    if isinstance(root_modification, dict):
+        for key, value in root_modification.items():
+            if key not in feedback or feedback.get(key) in [None, "", []]:
+                feedback[key] = value
+
+    root_modification_text = normalize_training_modification_text(root_modification)
+    if root_modification_text and not feedback.get("modification_request"):
+        feedback["modification_request"] = root_modification_text
+
+    if not feedback.get("modification_request"):
+        inline_text = normalize_training_modification_text({
+            "reason": feedback.get("reason"),
+            "notes": feedback.get("notes"),
+            "request": feedback.get("request"),
+            "message": feedback.get("message"),
+        })
+        if inline_text:
+            feedback["modification_request"] = inline_text
+
+    if request.user_summary.injuries and not feedback.get("pain_areas"):
+        feedback["pain_areas"] = request.user_summary.injuries
+
+    return feedback
+
+def extract_training_schedule(current_plan: Dict[str, Any]):
+    if not isinstance(current_plan, dict):
+        return []
+    plan_data = current_plan.get("plan_data")
+    if isinstance(plan_data, dict) and isinstance(plan_data.get("schedule"), list):
+        return plan_data.get("schedule") or []
+    if isinstance(current_plan.get("schedule"), list):
+        return current_plan.get("schedule") or []
+    if isinstance(current_plan.get("days"), list):
+        return current_plan.get("days") or []
+    return []
+
+def build_modify_training_rag_search_query(request: SmartModifyTrainingRequest, user_feedback: Dict[str, Any]):
+    user = request.user_summary
+    pieces = [
+        str(user.level or "beginner"),
+        str(user.goal or "fitness"),
+        "training plan modification exercises",
+        normalize_training_modification_text(user_feedback.get("modification_request")),
+    ]
+
+    for injury in (user.injuries or [])[:4]:
+        pieces.append(f"safe exercise for {injury}")
+    pain_areas = user_feedback.get("pain_areas", [])
+    if pain_areas in [None, ""]:
+        pain_areas = []
+    elif not isinstance(pain_areas, list):
+        pain_areas = [pain_areas]
+    for pain_area in pain_areas[:4]:
+        pieces.append(f"safe exercise for {pain_area}")
+    for weak_point in (user.weak_points or [])[:4]:
+        pieces.append(f"weak point {weak_point}")
+
+    current_schedule = extract_training_schedule(request.current_plan)
+    for day in current_schedule[:4]:
+        if not isinstance(day, dict):
+            continue
+        if day.get("focus"):
+            pieces.append(str(day.get("focus")))
+        for exercise in (day.get("exercises") or [])[:3]:
+            if isinstance(exercise, dict) and exercise.get("name"):
+                pieces.append(str(exercise.get("name")))
+
+    return " ".join(str(piece).strip() for piece in pieces if str(piece).strip())
+
+def build_modify_training_user_payload(
+    request: SmartModifyTrainingRequest,
+    user_feedback: Dict[str, Any],
+    retrieval_query: str,
+):
+    return {
+        "current_plan_id": training_plan_id_from_request(request),
+        "user_summary": model_to_plain_dict(request.user_summary),
+        "user_feedback": user_feedback,
+        "modification_request": normalize_training_modification_text(
+            user_feedback.get("modification_request")
+        ),
+        "current_plan": request.current_plan,
+        "current_schedule": extract_training_schedule(request.current_plan),
+        "retrieval_query": retrieval_query,
+    }
+
+def has_shoulder_pain_context(request: SmartModifyTrainingRequest, user_feedback: Dict[str, Any]):
+    parts = []
+    parts.extend(request.user_summary.injuries or [])
+
+    for key in ["pain_areas", "injuries", "modification_request", "reason", "notes", "request", "message"]:
+        value = user_feedback.get(key)
+        if isinstance(value, list):
+            parts.extend(value)
+        elif value not in [None, "", []]:
+            parts.append(value)
+
+    text = normalize_term(" ".join(str(part) for part in parts))
+    return "shoulder" in text and any(
+        marker in text
+        for marker in ["pain", "injury", "injuries", "injured", "ache", "discomfort", "sore", "strain", "shoulder"]
+    )
+
+def is_rehab_safe_shoulder_context(exercise: Dict[str, Any]):
+    text = normalize_term(
+        " ".join(
+            str(exercise.get(key, ""))
+            for key in ["name", "reason", "intensity", "notes", "description"]
+        )
+    )
+    rehab_markers = [
+        "rehab",
+        "physio",
+        "physical therapy",
+        "very light",
+        "pain free",
+        "pain-free",
+        "mobility",
+        "isometric",
+        "external rotation",
+        "scapular",
+        "band pull apart",
+    ]
+    return any(marker in text for marker in rehab_markers)
+
+def is_risky_for_shoulder_pain(exercise: Dict[str, Any]):
+    name = normalize_term(exercise.get("name", ""))
+    if not name:
+        return False
+
+    always_blocked = [
+        "shoulder press",
+        "arnold press",
+        "overhead press",
+        "military press",
+        "upright row",
+    ]
+    direct_isolation = [
+        "lateral raise",
+        "front raise",
+        "rear delt",
+        "face pull",
+        "shoulder raise",
+        "deltoid raise",
+        "delt raise",
+    ]
+    controlled_press_markers = [
+        "machine",
+        "cable",
+        "light",
+        "neutral grip",
+        "assisted",
+        "supported",
+    ]
+
+    if any(keyword in name for keyword in always_blocked):
+        return True
+    if any(keyword in name for keyword in direct_isolation):
+        return True
+    if "dip" in name or "pushup" in name or "push up" in name or "push-up" in name:
+        return True
+    if "bench press" in name:
+        return True
+    if "incline press" in name or "decline press" in name:
+        return True
+    if "incline dumbbell press" in name or "dumbbell press" in name:
+        return True
+    if "heavy" in name and "press" in name:
+        return True
+    if "barbell" in name and "press" in name and "leg press" not in name:
+        return True
+    if "press" in name and "leg press" not in name and any(
+        marker in name for marker in ["bench", "incline", "decline", "dumbbell", "barbell"]
+    ):
+        return True
+    if "chest press" in name and not any(marker in name for marker in controlled_press_markers):
+        return True
+    if "fly" in name and not any(marker in name for marker in ["machine", "cable", "light"]):
+        return True
+    return False
+
+def retrieved_exercise_to_guard_candidate(item):
+    meta = item.get("metadata") or {}
+    source_id = meta.get("id")
+    if source_id in [None, ""]:
+        source_id = item.get("id")
+    name = safe_str(meta.get("name"), "").strip()
+    if not name or source_id in [None, ""]:
+        return None
+    return {
+        "exercise_id": source_id,
+        "source_id": source_id,
+        "name": name,
+        "muscle_group": meta.get("muscle_group"),
+        "normalized_muscle_group": meta.get("normalized_muscle_group"),
+        "body_area": meta.get("body_area"),
+        "goal_tags": meta.get("goal_tags"),
+        "search_quality": meta.get("search_quality"),
+        "document": item.get("document"),
+        "difficulty": meta.get("difficulty"),
+        "score": distance_to_score(item.get("distance")),
+    }
+
+def guard_candidate_text(candidate):
+    return normalize_term(
+        " ".join(
+            str(candidate.get(key, ""))
+            for key in [
+                "name",
+                "muscle_group",
+                "normalized_muscle_group",
+                "body_area",
+                "goal_tags",
+                "difficulty",
+                "document",
+            ]
+        )
+    )
+
+def guard_candidate_muscle_group(candidate):
+    normalized = normalize_label(candidate.get("normalized_muscle_group"))
+    if normalized and normalized not in {"general", "unknown"}:
+        return normalized
+
+    inferred = infer_normalized_muscle_group(
+        candidate.get("muscle_group"),
+        candidate.get("name"),
+        description=candidate.get("document"),
+    )
+    return normalize_label(inferred) or "general"
+
+def guard_candidate_body_area(candidate):
+    body_area = normalize_label(candidate.get("body_area"))
+    if body_area and body_area not in {"general", "unknown"}:
+        return body_area
+    return infer_body_area(guard_candidate_muscle_group(candidate), candidate.get("muscle_group"))
+
+def is_lower_body_candidate(candidate):
+    text = normalize_term(
+        " ".join(
+            str(candidate.get(key, ""))
+            for key in ["name", "muscle_group", "normalized_muscle_group"]
+        )
+    )
+    lower_markers = [
+        "leg",
+        "legs",
+        "quad",
+        "hamstring",
+        "calf",
+        "glute",
+        "squat",
+        "lunge",
+        "leg press",
+        "leg extension",
+        "leg curl",
+    ]
+    return any(marker in text for marker in lower_markers)
+
+def focus_is_upper_or_push(focus):
+    text = normalize_term(focus)
+    return any(marker in text for marker in ["push", "upper", "chest", "shoulder", "tricep"])
+
+def shoulder_guard_focus_family(focus):
+    text = normalize_term(focus)
+    if any(marker in text for marker in ["push", "chest", "pec", "tricep"]):
+        return "push_chest"
+    if any(marker in text for marker in ["pull", "back", "bicep"]):
+        return "pull"
+    if any(marker in text for marker in ["leg", "lower", "quad", "hamstring", "glute"]):
+        return "lower"
+    return "general"
+
+def is_controlled_upper_candidate(candidate):
+    text = guard_candidate_text(candidate)
+    return any(
+        marker in text
+        for marker in [
+            "machine",
+            "cable",
+            "rope",
+            "band",
+            "light",
+            "supported",
+            "seated",
+            "neutral grip",
+            "assisted",
+            "pec deck",
+        ]
+    )
+
+def is_chest_guard_candidate(candidate):
+    text = guard_candidate_text(candidate)
+    muscle = guard_candidate_muscle_group(candidate)
+    if "chest supported" in text and "row" in text:
+        return False
+    return muscle == "chest" or any(
+        marker in text
+        for marker in [
+            "chest press",
+            "pec deck",
+            "cable crossover",
+            "cable fly",
+            "chest fly",
+            "chest machine",
+        ]
+    )
+
+def is_safe_controlled_chest_candidate(candidate):
+    return is_chest_guard_candidate(candidate) and is_controlled_upper_candidate(candidate)
+
+def is_triceps_isolation_candidate(candidate):
+    text = guard_candidate_text(candidate)
+    muscle = guard_candidate_muscle_group(candidate)
+    return muscle == "triceps" or any(
+        marker in text
+        for marker in [
+            "tricep pushdown",
+            "triceps pushdown",
+            "rope pushdown",
+            "tricep extension",
+            "triceps extension",
+            "kickback",
+        ]
+    )
+
+def is_pull_or_arm_pull_candidate(candidate):
+    text = guard_candidate_text(candidate)
+    muscle = guard_candidate_muscle_group(candidate)
+    if muscle in {"back", "biceps"}:
+        return True
+    return any(
+        marker in text
+        for marker in [" row", "pulldown", "pull down", "pullup", "pull up", "lat ", "bicep", "curl"]
+    )
+
+def is_neutral_safe_upper_candidate(candidate):
+    if is_lower_body_candidate(candidate) or is_pull_or_arm_pull_candidate(candidate):
+        return False
+    muscle = guard_candidate_muscle_group(candidate)
+    body_area = guard_candidate_body_area(candidate)
+    if is_rehab_safe_shoulder_context(candidate):
+        return True
+    if muscle in {"arms", "upper_body", "general"} and body_area in {"upper_body", "general"}:
+        return True
+    return False
+
+def shoulder_guard_push_candidate_tier(candidate):
+    if is_lower_body_candidate(candidate) or is_pull_or_arm_pull_candidate(candidate):
+        return None
+    if is_safe_controlled_chest_candidate(candidate):
+        return 0
+    if is_triceps_isolation_candidate(candidate):
+        return 1
+    if is_chest_guard_candidate(candidate):
+        return 2
+    if is_neutral_safe_upper_candidate(candidate):
+        return 3
+    return None
+
+def shoulder_guard_focus_alignment_score(candidate, focus):
+    family = shoulder_guard_focus_family(focus)
+    muscle = guard_candidate_muscle_group(candidate)
+    score = 0
+
+    if family == "push_chest":
+        if is_safe_controlled_chest_candidate(candidate):
+            score += 5
+        elif is_chest_guard_candidate(candidate):
+            score += 4
+        if is_triceps_isolation_candidate(candidate):
+            score += 4
+        if is_neutral_safe_upper_candidate(candidate):
+            score += 1
+        return score
+
+    focus_text = normalize_term(focus)
+    if muscle and muscle in focus_text:
+        score += 4
+    if exercise_matches_focus(candidate.get("name"), focus):
+        score += 3
+    if family == "pull" and muscle in {"back", "biceps"}:
+        score += 4
+    if family == "lower" and is_lower_body_candidate(candidate):
+        score += 4
+    return score
+
+def shoulder_guard_candidate_rank(candidate, focus=None):
+    if is_risky_for_shoulder_pain(candidate):
+        return None
+
+    family = shoulder_guard_focus_family(focus)
+    if family == "push_chest":
+        tier = shoulder_guard_push_candidate_tier(candidate)
+        if tier is None:
+            return None
+    else:
+        if focus_is_upper_or_push(focus) and is_lower_body_candidate(candidate):
+            return None
+        tier = 0 if shoulder_guard_focus_alignment_score(candidate, focus) > 0 else 2
+
+    retrieved_score = safe_float(candidate.get("score"), 0.0) or 0.0
+    return (
+        tier,
+        -shoulder_guard_focus_alignment_score(candidate, focus),
+        -int(is_controlled_upper_candidate(candidate)),
+        -retrieved_score,
+        safe_str(candidate.get("name")).lower(),
+    )
+
+def find_shoulder_safe_retrieved_replacement(retrieved_items, used_source_ids, focus=None):
+    ranked_candidates = []
+    for item in retrieved_items or []:
+        candidate = retrieved_exercise_to_guard_candidate(item)
+        if not candidate:
+            continue
+        candidate_id = str(candidate.get("source_id"))
+        if candidate_id in used_source_ids:
+            continue
+        if is_risky_for_shoulder_pain(candidate):
+            continue
+        rank = shoulder_guard_candidate_rank(candidate, focus=focus)
+        if rank is None:
+            continue
+        ranked_candidates.append((rank, candidate))
+
+    if not ranked_candidates:
+        return None
+
+    ranked_candidates.sort(key=lambda item: item[0])
+    return ranked_candidates[0][1]
+
+def apply_shoulder_safety_guard_to_modified_schedule(
+    schedule,
+    request: SmartModifyTrainingRequest,
+    user_feedback: Dict[str, Any],
+    retrieved_items,
+):
+    if not has_shoulder_pain_context(request, user_feedback):
+        return [], [], [], []
+
+    guard_changes = []
+    guard_warnings = [
+        "Shoulder pain reported: avoid overhead pressing and direct shoulder-isolation movements unless cleared and pain-free.",
+        "If shoulder pain persists or worsens, stop the exercise and review the plan with a coach or physiotherapist.",
+    ]
+    guard_recommendations = [
+        "Use pain-free ranges of motion, conservative loads, and avoid forcing shoulder-focused replacements."
+    ]
+    guard_sources = []
+    used_source_ids = {
+        str(exercise.get("source_id") or exercise.get("exercise_id"))
+        for day in schedule
+        for exercise in day.get("exercises", [])
+        if exercise.get("source_id") is not None or exercise.get("exercise_id") is not None
+    }
+
+    for day in schedule:
+        safe_exercises = []
+        for exercise in day.get("exercises", []):
+            if not is_risky_for_shoulder_pain(exercise):
+                safe_exercises.append(exercise)
+                continue
+
+            risky_name = safe_str(exercise.get("name"), "risky shoulder exercise")
+            replacement = find_shoulder_safe_retrieved_replacement(
+                retrieved_items,
+                used_source_ids,
+                focus=day.get("focus"),
+            )
+            if replacement:
+                replacement_exercise = {
+                    "exercise_id": replacement["exercise_id"],
+                    "name": replacement["name"],
+                    "sets": exercise.get("sets", 2),
+                    "reps": exercise.get("reps", "10-12"),
+                    "rest_seconds": exercise.get("rest_seconds", 90),
+                    "intensity": "light_to_moderate",
+                    "reason": (
+                        f"Safety guard replacement for {risky_name}: shoulder pain was reported, "
+                        "so direct shoulder/overhead stress was avoided."
+                    ),
+                    "source_id": replacement["source_id"],
+                }
+                safe_exercises.append(replacement_exercise)
+                used_source_ids.add(str(replacement["source_id"]))
+                guard_sources.append({
+                    "source_id": replacement["source_id"],
+                    "source_table": "exercises",
+                    "source_name": replacement["name"],
+                    "score": replacement.get("score"),
+                    "reason_used": "Used by shoulder safety guard as a safer retrieved replacement.",
+                })
+                guard_changes.append(
+                    f"Safety guard replaced '{risky_name}' with '{replacement['name']}' because shoulder pain was reported."
+                )
+            else:
+                removal_message = (
+                    f"Safety guard removed '{risky_name}' because shoulder pain was reported "
+                    "and no safer focus-aligned retrieved replacement was available."
+                )
+                guard_changes.append(removal_message)
+                guard_warnings.append(removal_message)
+
+        day["exercises"] = safe_exercises
+
+    return guard_changes, guard_warnings, guard_recommendations, guard_sources
+
+def unique_strings(*groups, limit=None):
+    merged = []
+    for group in groups:
+        for value in group or []:
+            if value not in merged:
+                merged.append(value)
+            if limit and len(merged) >= limit:
+                return merged
+    return merged
+
+def used_training_source_ids(schedule):
+    return {
+        str(exercise.get("source_id") or exercise.get("exercise_id"))
+        for day in schedule
+        for exercise in day.get("exercises", [])
+        if exercise.get("source_id") is not None or exercise.get("exercise_id") is not None
+    }
+
+def merge_sources_for_used_training_exercises(existing_sources, guard_sources, schedule):
+    used_source_ids = used_training_source_ids(schedule)
+    merged = []
+    seen = set()
+
+    for source in (existing_sources or []) + (guard_sources or []):
+        source_dict = model_to_plain_dict(source)
+        source_id = str(source_dict.get("source_id"))
+        if source_id not in used_source_ids or source_id in seen:
+            continue
+        merged.append(source_dict)
+        seen.add(source_id)
+
+    return merged
+
+def fetch_retrieved_items_for_modify_training_guard(
+    request: SmartModifyTrainingRequest,
+    user_feedback: Dict[str, Any],
+):
+    try:
+        retrieval_query = build_modify_training_rag_search_query(request, user_feedback)
+        results = search_exercises(retrieval_query, n_results=30)
+        return unpack_chroma_results(results)
+    except Exception as error:
+        log_rag_exception("modify_training_guard_retrieval", error)
+        return []
+
+def apply_shoulder_safety_guard_to_legacy_modify_result(
+    result,
+    request: SmartModifyTrainingRequest,
+    user_feedback: Dict[str, Any],
+):
+    if not isinstance(result, dict):
+        return result
+
+    modified_plan = result.get("modified_plan")
+    if not isinstance(modified_plan, dict):
+        return result
+
+    schedule = extract_training_schedule(modified_plan)
+    if not schedule:
+        return result
+
+    retrieved_items = fetch_retrieved_items_for_modify_training_guard(request, user_feedback)
+    guard_changes, guard_warnings, guard_recommendations, guard_sources = (
+        apply_shoulder_safety_guard_to_modified_schedule(
+            schedule,
+            request,
+            user_feedback,
+            retrieved_items,
+        )
+    )
+    if not guard_changes and not guard_warnings and not guard_recommendations:
+        return result
+
+    plan_data = modified_plan.get("plan_data")
+    if not isinstance(plan_data, dict):
+        plan_data = {}
+    plan_data["schedule"] = schedule
+    modified_plan["plan_data"] = plan_data
+    if "schedule" in modified_plan:
+        modified_plan["schedule"] = schedule
+
+    result["changes_summary"] = unique_strings(
+        guard_changes,
+        result.get("changes_summary"),
+        limit=20,
+    )
+    result["recommendations"] = unique_strings(
+        result.get("recommendations"),
+        guard_recommendations,
+        limit=8,
+    )
+    result["injury_warnings"] = unique_strings(
+        guard_warnings,
+        result.get("injury_warnings"),
+    )
+    result["sources"] = merge_sources_for_used_training_exercises(
+        result.get("sources"),
+        guard_sources,
+        schedule,
+    )
+    return result
+
+def modified_training_rag_response_to_legacy_response(
+    rag_response,
+    request: SmartModifyTrainingRequest,
+    user_feedback: Dict[str, Any],
+    retrieved_items=None,
+):
+    schedule = []
+    for day in rag_response.modified_plan.schedule:
+        exercises = []
+        for exercise in day.exercises:
+            exercises.append({
+                "exercise_id": exercise.exercise_id,
+                "name": exercise.name,
+                "sets": exercise.sets,
+                "reps": exercise.reps,
+                "rest_seconds": exercise.rest_seconds if exercise.rest_seconds is not None else 90,
+                "intensity": exercise.intensity,
+                "reason": exercise.reason,
+                "source_id": exercise.source_id,
+            })
+
+        schedule.append({
+            "day": day.day,
+            "focus": day.focus,
+            "exercises": exercises,
+        })
+
+    if not schedule:
+        raise ValueError("LLM response did not include a modified training schedule")
+
+    guard_changes, guard_warnings, guard_recommendations, guard_sources = (
+        apply_shoulder_safety_guard_to_modified_schedule(
+            schedule,
+            request,
+            user_feedback,
+            retrieved_items or [],
+        )
+    )
+
+    modified_plan = copy.deepcopy(request.current_plan or {})
+    if not isinstance(modified_plan, dict):
+        modified_plan = {}
+
+    plan_data = modified_plan.get("plan_data")
+    if not isinstance(plan_data, dict):
+        plan_data = {}
+    plan_data["schedule"] = schedule
+    modified_plan["plan_data"] = plan_data
+
+    if "schedule" in modified_plan or "plan_data" not in (request.current_plan or {}):
+        modified_plan["schedule"] = schedule
+
+    changes_summary = list(guard_changes)
+    changes_summary.extend(rag_response.changes_summary or [rag_response.summary])
+    recommendations = list(rag_response.recommendations or [
+        "Stop any movement that causes sharp pain and adjust load conservatively."
+    ])
+    recommendations.extend(guard_recommendations)
+    injury_warnings = list(guard_warnings)
+    injury_warnings.extend(
+        warning for warning in (rag_response.injury_warnings or []) if warning not in injury_warnings
+    )
+    used_source_ids = used_training_source_ids(schedule)
+    sources = [
+        model_to_plain_dict(source)
+        for source in rag_response.sources
+        if str(source.source_id) in used_source_ids
+    ]
+    existing_source_ids = {str(source.get("source_id")) for source in sources}
+    for source in guard_sources:
+        if str(source.get("source_id")) not in existing_source_ids:
+            sources.append(source)
+            existing_source_ids.add(str(source.get("source_id")))
+
+    return {
+        "status": rag_response.status,
+        "plan_id": training_plan_id_from_request(request),
+        "version": next_training_plan_version(request.current_plan),
+        "changes_summary": changes_summary[:20],
+        "modified_plan": modified_plan,
+        "recommendations": recommendations[:8],
+        "generation_mode": "rag",
+        "rag_summary": rag_response.summary,
+        "sources": sources,
+        "injury_warnings": injury_warnings,
     }
 
 def generate_training_plan_rag(request: GenerateTrainingRequest):
@@ -2361,7 +3129,11 @@ def generate_training_plan_rag(request: GenerateTrainingRequest):
         raise RAGGenerationError("invalid_llm_json", sanitize_rag_error_message(error), error) from error
 
     try:
-        response = training_rag_response_to_legacy_response(rag_response, request)
+        response = training_rag_response_to_legacy_response(
+            rag_response,
+            request,
+            retrieved_items=retrieved_items,
+        )
         rag_logger.info("training_rag.legacy_conversion_done")
         return response
     except Exception as error:
@@ -2372,12 +3144,142 @@ def generate_training_plan_rag(request: GenerateTrainingRequest):
             error,
         ) from error
 
+def generate_modified_training_plan_rag(request: SmartModifyTrainingRequest):
+    user_feedback = resolve_training_modification_feedback(request)
+    retrieval_query = build_modify_training_rag_search_query(request, user_feedback)
+    rag_logger.info("modify_training_rag.retrieval_start user_id=%s", request.user_summary.user_id)
+
+    try:
+        results = search_exercises(retrieval_query, n_results=30)
+        retrieved_items = unpack_chroma_results(results)
+    except Exception as error:
+        log_rag_exception("modify_training_retrieval", error)
+        raise RAGGenerationError("rag_generation_failed", sanitize_rag_error_message(error), error) from error
+
+    rag_logger.info("modify_training_rag.retrieval_done retrieved_exercises=%s", len(retrieved_items))
+    if not retrieved_items:
+        message = "No retrieved exercises found for RAG training modification"
+        rag_logger.warning("modify_training_rag.retrieval_empty: %s", message)
+        raise RAGGenerationError("no_retrieved_exercises", message)
+
+    exercise_context = build_exercise_context(results)
+    if not exercise_context.strip():
+        message = "No retrieved exercises found for RAG training modification"
+        rag_logger.warning("modify_training_rag.context_empty: %s", message)
+        raise RAGGenerationError("no_retrieved_exercises", message)
+
+    user_payload = build_modify_training_user_payload(request, user_feedback, retrieval_query)
+    messages = build_modify_training_plan_prompt(user_payload, exercise_context)
+    rag_logger.info(
+        "modify_training_rag.prompt_built message_count=%s context_chars=%s",
+        len(messages),
+        len(exercise_context),
+    )
+
+    try:
+        rag_logger.info("modify_training_rag.llm_call_start provider=%s", settings.LLM_PROVIDER)
+        llm_text = call_llm_chat(
+            messages,
+            response_schema=modified_training_plan_response_schema(),
+        )
+        rag_logger.info(
+            "modify_training_rag.llm_call_done provider=%s response_chars=%s",
+            settings.LLM_PROVIDER,
+            len(llm_text or ""),
+        )
+    except Exception as error:
+        log_rag_exception("modify_training_llm_call", error)
+        category = classify_llm_error(error)
+        raise RAGGenerationError(category, sanitize_rag_error_message(error), error) from error
+
+    try:
+        rag_response = parse_modified_training_plan_response(llm_text)
+        rag_logger.info("modify_training_rag.parse_done")
+    except ValidationError as error:
+        log_rag_exception("modify_training_parse_validation", error)
+        raise RAGGenerationError(
+            "rag_schema_validation_failed",
+            sanitize_rag_error_message(error),
+            error,
+        ) from error
+    except ValueError as error:
+        log_rag_exception("modify_training_parse_json", error)
+        raise RAGGenerationError("invalid_llm_json", sanitize_rag_error_message(error), error) from error
+    except Exception as error:
+        log_rag_exception("modify_training_parse_unknown", error)
+        raise RAGGenerationError("invalid_llm_json", sanitize_rag_error_message(error), error) from error
+
+    try:
+        response = modified_training_rag_response_to_legacy_response(
+            rag_response,
+            request,
+            user_feedback,
+            retrieved_items=retrieved_items,
+        )
+        rag_logger.info("modify_training_rag.legacy_conversion_done")
+        return response
+    except Exception as error:
+        log_rag_exception("modify_training_legacy_conversion", error)
+        raise RAGGenerationError(
+            "rag_legacy_conversion_failed",
+            sanitize_rag_error_message(error),
+            error,
+        ) from error
+
+def fetch_retrieved_items_for_generate_training_guard(request: GenerateTrainingRequest):
+    try:
+        retrieval_query = build_training_rag_search_query(request)
+        results = search_exercises(retrieval_query, n_results=30)
+        return unpack_chroma_results(results)
+    except Exception as error:
+        log_rag_exception("generate_training_guard_retrieval", error)
+        return []
+
+def apply_shoulder_safety_guard_to_generated_training_result(
+    result,
+    request: GenerateTrainingRequest,
+):
+    if not isinstance(result, dict):
+        return result
+    plan_data = result.get("plan_data")
+    if not isinstance(plan_data, dict):
+        return result
+    schedule = plan_data.get("schedule")
+    if not isinstance(schedule, list) or not schedule:
+        return result
+
+    retrieved_items = fetch_retrieved_items_for_generate_training_guard(request)
+    guard_changes, guard_warnings, _, guard_sources = (
+        apply_shoulder_safety_guard_to_modified_schedule(
+            schedule,
+            request,
+            {},
+            retrieved_items,
+        )
+    )
+    if not guard_changes and not guard_warnings:
+        return result
+
+    result["injury_warnings"] = unique_strings(
+        guard_warnings,
+        result.get("injury_warnings"),
+    )
+    result["sources"] = merge_sources_for_used_training_exercises(
+        result.get("sources"),
+        guard_sources,
+        schedule,
+    )
+    plan_data["schedule"] = schedule
+    result["plan_data"] = plan_data
+    return result
+
 @app.post("/generate-training-plan")
 async def generate_training_plan(request: GenerateTrainingRequest):
     try:
         return generate_training_plan_rag(request)
     except Exception as rag_error:
         fallback = generate_training_plan_rule_based(request)
+        fallback = apply_shoulder_safety_guard_to_generated_training_result(fallback, request)
         fallback["generation_mode"] = "rule_based_fallback"
         fallback["fallback_reason"] = safe_training_fallback_reason(rag_error)
         if settings.DEBUG:
@@ -2389,15 +3291,30 @@ async def generate_training_plan(request: GenerateTrainingRequest):
 @app.post("/modify-training-plan")
 async def modify_training_plan(request: SmartModifyTrainingRequest):
     try:
-        result = analyze_plan_and_suggest_modifications(
-            current_plan=request.current_plan,
-            user_feedback=request.user_feedback,
-            search_func=search_exercises
-        )
-        return result
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        return generate_modified_training_plan_rag(request)
+    except Exception as rag_error:
+        try:
+            user_feedback = resolve_training_modification_feedback(request)
+            result = analyze_plan_and_suggest_modifications(
+                current_plan=request.current_plan,
+                user_feedback=user_feedback,
+                search_func=search_exercises
+            )
+            result = apply_shoulder_safety_guard_to_legacy_modify_result(
+                result,
+                request,
+                user_feedback,
+            )
+            result["generation_mode"] = "fallback"
+            result["fallback_reason"] = safe_training_fallback_reason(rag_error)
+            result.setdefault("status", "success")
+            if settings.DEBUG:
+                result["rag_debug_error_type"] = rag_debug_error_type(rag_error)
+                result["rag_debug_error_message"] = sanitize_rag_error_message(rag_error)
+            return result
+        except Exception as e:
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 def normalize_term(value: str) -> str:
@@ -2850,7 +3767,7 @@ def deduplicate_food_results_for_prompt(results):
 
     return pack_chroma_results(list(deduped.values()))
 
-def nutrition_rag_response_to_legacy_response(rag_response, request: GenerateNutritionRequest):
+def nutrition_rag_response_to_legacy_response(rag_response, request: GenerateNutritionRequest, retrieved_items=None):
     daily_meals = []
     total_daily = {"calories": 0.0, "protein": 0.0, "carbs": 0.0, "fat": 0.0}
     normalized_target_macros = normalize_nutrition_target_macros(request.target_macros)
@@ -2904,21 +3821,16 @@ def nutrition_rag_response_to_legacy_response(rag_response, request: GenerateNut
     )
 
     if estimated_target_calories and total_daily["calories"] < (estimated_target_calories * 0.6):
-        message = (
-            f"Nutrition totals too low: recalculated calories {total_daily['calories']:g} "
-            f"below 60% of estimated target calories {estimated_target_calories:g}"
-        )
         rag_logger.warning(
-            "nutrition_rag.nutrition_totals_too_low triggered total_calories=%s threshold=%s estimated_target_calories=%s",
+            "nutrition_rag.nutrition_totals_low_before_guard total_calories=%s threshold=%s estimated_target_calories=%s",
             total_daily["calories"],
             round(estimated_target_calories * 0.6, 2),
             estimated_target_calories,
         )
-        raise RAGGenerationError("nutrition_totals_too_low", message)
 
     macro_targets = normalized_target_macros or model_to_plain_dict(rag_response.macro_targets)
 
-    return {
+    response = {
         "status": rag_response.status,
         "plan_id": f"meal_{request.user_summary.user_id}_{int(datetime.now().timestamp())}",
         "version": 1,
@@ -2936,6 +3848,11 @@ def nutrition_rag_response_to_legacy_response(rag_response, request: GenerateNut
         "sources": [model_to_plain_dict(source) for source in rag_response.sources],
         "allergy_warnings": rag_response.allergy_warnings,
     }
+    return apply_nutrition_safety_guard_to_plan_result(
+        response,
+        nutrition_generation_guard_feedback(request),
+        retrieved_items or [],
+    )
 
 def generate_nutrition_plan_rag(request: GenerateNutritionRequest):
     retrieval_query = build_nutrition_rag_search_query(request)
@@ -3015,7 +3932,11 @@ def generate_nutrition_plan_rag(request: GenerateNutritionRequest):
         raise RAGGenerationError("invalid_llm_json", sanitize_rag_error_message(error), error) from error
 
     try:
-        response = nutrition_rag_response_to_legacy_response(rag_response, request)
+        response = nutrition_rag_response_to_legacy_response(
+            rag_response,
+            request,
+            retrieved_items=deduped_items,
+        )
         rag_logger.info("nutrition_rag.legacy_conversion_done")
         return response
     except RAGGenerationError:
@@ -3034,6 +3955,11 @@ async def generate_nutrition_plan(request: GenerateNutritionRequest):
         return generate_nutrition_plan_rag(request)
     except Exception as rag_error:
         fallback = generate_nutrition_plan_rule_based(request)
+        fallback = apply_nutrition_safety_guard_to_plan_result(
+            fallback,
+            nutrition_generation_guard_feedback(request),
+            fetch_retrieved_items_for_generate_nutrition_guard(request),
+        )
         fallback["generation_mode"] = "rule_based_fallback"
         fallback["fallback_reason"] = safe_nutrition_fallback_reason(rag_error)
         if settings.DEBUG:
@@ -3043,17 +3969,1188 @@ async def generate_nutrition_plan(request: GenerateNutritionRequest):
         return fallback
 
 
+def nutrition_plan_id_from_request(request: SmartModifyNutritionRequest):
+    return request.current_plan_id or request.current_plan.get("plan_id", "unknown")
+
+def next_nutrition_plan_version(current_plan: Dict[str, Any]):
+    try:
+        return int(current_plan.get("version", 1)) + 1
+    except (TypeError, ValueError):
+        return 2
+
+def resolve_nutrition_modification_feedback(request: SmartModifyNutritionRequest):
+    feedback = model_to_plain_dict(request.user_feedback) if request.user_feedback else {}
+    preferences = model_to_plain_dict(request.preferences) if request.preferences else {}
+
+    for key, value in preferences.items():
+        if key not in feedback or feedback.get(key) in [None, "", []]:
+            feedback[key] = value
+
+    root_modification = request.modification_request
+    if isinstance(root_modification, dict):
+        for key, value in root_modification.items():
+            if key not in feedback or feedback.get(key) in [None, "", []]:
+                feedback[key] = value
+
+    root_modification_text = normalize_training_modification_text(root_modification)
+    if root_modification_text and not feedback.get("modification_request"):
+        feedback["modification_request"] = root_modification_text
+
+    if not feedback.get("modification_request"):
+        inline_text = normalize_training_modification_text({
+            "reason": feedback.get("reason"),
+            "notes": feedback.get("notes"),
+            "request": feedback.get("request"),
+            "message": feedback.get("message"),
+        })
+        if inline_text:
+            feedback["modification_request"] = inline_text
+
+    if request.target_macros and not feedback.get("target_macros"):
+        feedback["target_macros"] = model_to_plain_dict(request.target_macros)
+
+    if request.user_summary.goal and not feedback.get("goal"):
+        feedback["goal"] = request.user_summary.goal
+
+    if "allergies" in feedback and not feedback.get("food_allergies"):
+        feedback["food_allergies"] = feedback.get("allergies")
+    if "food_allergies" in feedback and not feedback.get("allergies"):
+        feedback["allergies"] = feedback.get("food_allergies")
+
+    for key in ["liked_foods", "disliked_foods"]:
+        if key in feedback:
+            feedback[key] = as_list(feedback.get(key))
+
+    return feedback
+
+def modified_nutrition_target_macros(request: SmartModifyNutritionRequest, user_feedback: Dict[str, Any]):
+    return normalize_nutrition_target_macros(
+        request.target_macros or user_feedback.get("target_macros")
+    )
+
+def extract_nutrition_daily_meals(current_plan: Dict[str, Any]):
+    if not isinstance(current_plan, dict):
+        return []
+    if isinstance(current_plan.get("daily_meals"), list):
+        return current_plan.get("daily_meals") or []
+    if isinstance(current_plan.get("meals"), list):
+        return current_plan.get("meals") or []
+    plan_data = current_plan.get("plan_data")
+    if isinstance(plan_data, dict):
+        if isinstance(plan_data.get("daily_meals"), list):
+            return plan_data.get("daily_meals") or []
+        if isinstance(plan_data.get("meals"), list):
+            return plan_data.get("meals") or []
+    return []
+
+def build_modify_nutrition_rag_search_query(
+    request: SmartModifyNutritionRequest,
+    user_feedback: Dict[str, Any],
+):
+    user = request.user_summary
+    normalized_target_macros = modified_nutrition_target_macros(request, user_feedback)
+    estimated_target_calories = estimate_calories_from_macros(normalized_target_macros)
+    pieces = [
+        str(user.goal or user_feedback.get("goal") or "balanced"),
+        "nutrition plan modification foods",
+        normalize_training_modification_text(user_feedback.get("modification_request")),
+    ]
+
+    meal_count = first_nutrition_preference(
+        user_feedback,
+        ["meal_count", "meals_per_day", "number_of_meals"],
+    )
+    if meal_count:
+        pieces.append(f"{meal_count} meals per day")
+
+    if estimated_target_calories:
+        pieces.append(f"{estimated_target_calories:g} calorie target")
+    if normalized_target_macros:
+        pieces.append(f"{normalized_target_macros['protein_g']:g}g protein")
+        pieces.append(f"{normalized_target_macros['carbs_g']:g}g carbs")
+        pieces.append(f"{normalized_target_macros['fat_g']:g}g fat")
+
+    allergies = as_list(first_present(user_feedback.get("food_allergies"), user_feedback.get("allergies")))
+    for allergy in allergies[:5]:
+        pieces.append(f"{allergy} allergy safe foods")
+
+    for liked in as_list(user_feedback.get("liked_foods"))[:5]:
+        pieces.append(str(liked))
+    for disliked in as_list(user_feedback.get("disliked_foods"))[:5]:
+        pieces.append(f"avoid {disliked}")
+
+    for meal in extract_nutrition_daily_meals(request.current_plan)[:6]:
+        if not isinstance(meal, dict):
+            continue
+        if meal.get("meal") or meal.get("meal_type"):
+            pieces.append(str(meal.get("meal") or meal.get("meal_type")))
+        for item in (meal.get("items") or meal.get("foods") or [])[:4]:
+            if isinstance(item, dict) and item.get("name"):
+                pieces.append(str(item.get("name")))
+
+    return " ".join(str(piece).strip() for piece in pieces if str(piece).strip())
+
+def build_modify_nutrition_user_payload(
+    request: SmartModifyNutritionRequest,
+    user_feedback: Dict[str, Any],
+    retrieval_query: str,
+):
+    normalized_target_macros = modified_nutrition_target_macros(request, user_feedback)
+    estimated_target_calories = estimate_calories_from_macros(normalized_target_macros)
+    allergies = as_list(first_present(user_feedback.get("food_allergies"), user_feedback.get("allergies")))
+    liked_foods = as_list(user_feedback.get("liked_foods"))
+    disliked_foods = as_list(user_feedback.get("disliked_foods"))
+
+    return {
+        "current_plan_id": nutrition_plan_id_from_request(request),
+        "user_summary": model_to_plain_dict(request.user_summary),
+        "preferences": model_to_plain_dict(request.preferences) if request.preferences else {},
+        "user_feedback": user_feedback,
+        "modification_request": normalize_training_modification_text(
+            user_feedback.get("modification_request")
+        ),
+        "target_macros": model_to_plain_dict(request.target_macros) if request.target_macros else user_feedback.get("target_macros"),
+        "normalized_target_macros": normalized_target_macros,
+        "estimated_target_calories": estimated_target_calories,
+        "meal_count": first_nutrition_preference(
+            user_feedback,
+            ["meal_count", "meals_per_day", "number_of_meals"],
+        ),
+        "allergies": allergies,
+        "liked_foods": liked_foods,
+        "disliked_foods": disliked_foods,
+        "current_plan": request.current_plan,
+        "current_daily_meals": extract_nutrition_daily_meals(request.current_plan),
+        "retrieval_query": retrieval_query,
+    }
+
+def nutrition_item_quantity_number(item):
+    quantity = item.get("quantity", 1) if isinstance(item, dict) else 1
+    value = numeric_value(quantity)
+    if value is None or value <= 0:
+        return 1.0
+    return value
+
+def recalculate_nutrition_daily_totals(daily_meals):
+    total_daily = {"calories": 0.0, "protein": 0.0, "carbs": 0.0, "fat": 0.0}
+    for meal in daily_meals or []:
+        for item in meal.get("items", []) or []:
+            quantity = nutrition_item_quantity_number(item)
+            total_daily["calories"] += safe_float(item.get("calories")) * quantity
+            total_daily["protein"] += safe_float(item.get("protein")) * quantity
+            total_daily["carbs"] += safe_float(item.get("carbs")) * quantity
+            total_daily["fat"] += safe_float(item.get("fat")) * quantity
+    return round_nutrition_totals(total_daily)
+
+def nutrition_source_id_from_item(item):
+    if not isinstance(item, dict):
+        return None
+    return item.get("source_id") or item.get("food_id") or item.get("nutrition_id")
+
+def used_nutrition_source_ids(daily_meals):
+    return {
+        str(source_id)
+        for meal in daily_meals or []
+        for item in meal.get("items", []) or []
+        for source_id in [nutrition_source_id_from_item(item)]
+        if source_id is not None
+    }
+
+def retrieved_food_source_id(item):
+    meta = item.get("metadata") or {}
+    return meta.get("id") if meta.get("id") not in [None, ""] else item.get("id")
+
+def retrieved_food_source_map(retrieved_items):
+    source_map = {}
+    for item in retrieved_items or []:
+        meta = item.get("metadata") or {}
+        source_id = retrieved_food_source_id(item)
+        if source_id in [None, ""]:
+            continue
+        source_map[str(source_id)] = {
+            "source_id": source_id,
+            "source_table": "foods",
+            "source_name": safe_str(meta.get("name"), "Food"),
+            "score": distance_to_score(item.get("distance")),
+            "reason_used": "Used in modified nutrition plan from retrieved food context.",
+        }
+    return source_map
+
+def merge_sources_for_used_nutrition_foods(existing_sources, guard_sources, daily_meals, retrieved_items=None):
+    used_source_ids = used_nutrition_source_ids(daily_meals)
+    source_lookup = retrieved_food_source_map(retrieved_items or [])
+    merged = []
+    seen = set()
+
+    for source in (existing_sources or []) + (guard_sources or []):
+        source_dict = model_to_plain_dict(source)
+        source_id = str(source_dict.get("source_id"))
+        if source_id not in used_source_ids or source_id in seen:
+            continue
+        merged.append(source_dict)
+        seen.add(source_id)
+
+    for source_id in sorted(used_source_ids):
+        if source_id in seen or source_id not in source_lookup:
+            continue
+        merged.append(source_lookup[source_id])
+        seen.add(source_id)
+
+    return merged
+
+def nutrition_food_to_legacy_item(food):
+    return {
+        "food_id": food.food_id,
+        "name": food.name,
+        "serving_size": food.serving_size,
+        "quantity": food.quantity,
+        "calories": food.calories,
+        "protein": food.protein,
+        "carbs": food.carbs,
+        "fat": food.fat,
+        "reason": food.reason,
+        "source_id": food.source_id,
+    }
+
+def retrieved_food_to_candidate(item):
+    meta = item.get("metadata") or {}
+    source_id = retrieved_food_source_id(item)
+    name = safe_str(meta.get("name"), "").strip()
+    if source_id in [None, ""] or not name:
+        return None
+    return {
+        "food_id": source_id,
+        "source_id": source_id,
+        "name": name,
+        "serving_size": meta.get("serving_size"),
+        "quantity": 1,
+        "calories": safe_float(meta.get("calories")),
+        "protein": safe_float(meta.get("protein")),
+        "carbs": safe_float(meta.get("carbs")),
+        "fat": safe_float(meta.get("fat")),
+        "score": distance_to_score(item.get("distance")),
+    }
+
+def nutrition_candidate_rank(candidate, user_feedback):
+    name = normalize_term(candidate.get("name"))
+    liked_foods = [normalize_term(food) for food in as_list(user_feedback.get("liked_foods"))]
+    goal = normalize_term(user_feedback.get("goal", "")).replace(" ", "_")
+    calories = safe_float(candidate.get("calories"))
+    protein = safe_float(candidate.get("protein"))
+    fat = safe_float(candidate.get("fat"))
+    retrieved_score = safe_float(candidate.get("score"), 0.0) or 0.0
+
+    score = retrieved_score
+    if any(liked and liked in name for liked in liked_foods):
+        score += 5
+    score += min(protein / 10, 4)
+    if goal in {"fat_loss", "weight_loss", "lower_calories"}:
+        if calories <= 250:
+            score += 2
+        if fat <= 10:
+            score += 1
+    return (-score, calories, safe_str(candidate.get("name")).lower())
+
+def is_nutrition_nut_candidate(candidate):
+    name = normalize_term(candidate.get("name"))
+    return any(
+        marker in name
+        for marker in ["almond", "walnut", "cashew", "pistachio", "hazelnut", "peanut", "nut butter"]
+    )
+
+def has_nutrition_nut_item(used_names):
+    return any(
+        any(marker in normalize_term(name) for marker in ["almond", "walnut", "cashew", "pistachio", "hazelnut"])
+        for name in used_names or []
+    )
+
+def requested_nutrition_meal_count(user_feedback):
+    value = first_nutrition_preference(
+        user_feedback,
+        ["meal_count", "meals_per_day", "number_of_meals"],
+    )
+    parsed = numeric_value(value)
+    if parsed is None:
+        return None
+    parsed = int(parsed)
+    if parsed <= 0:
+        return None
+    return min(parsed, 8)
+
+def ensure_nutrition_meal_count(daily_meals, user_feedback):
+    requested_count = requested_nutrition_meal_count(user_feedback)
+    if not requested_count or len(daily_meals) >= requested_count:
+        return []
+
+    default_names = ["Breakfast", "Lunch", "Dinner", "Snack"]
+    existing_names = {normalize_term(meal.get("meal")) for meal in daily_meals}
+    added_names = []
+
+    while len(daily_meals) < requested_count:
+        if len(daily_meals) < len(default_names):
+            candidate_name = default_names[len(daily_meals)]
+        else:
+            candidate_name = f"Meal {len(daily_meals) + 1}"
+
+        if normalize_term(candidate_name) in existing_names:
+            candidate_name = f"Meal {len(daily_meals) + 1}"
+
+        daily_meals.append({"meal": candidate_name, "items": []})
+        existing_names.add(normalize_term(candidate_name))
+        added_names.append(candidate_name)
+
+    return added_names
+
+def select_nutrition_meal_for_addition(daily_meals):
+    if not daily_meals:
+        return None
+    return min(
+        daily_meals,
+        key=lambda meal: (len(meal.get("items", []) or []), safe_str(meal.get("meal")).lower()),
+    )
+
+def nutrition_macro_fill_rank(
+    candidate,
+    user_feedback,
+    total_daily=None,
+    target_macros=None,
+    target_calories=None,
+    used_names=None,
+):
+    if not total_daily or not target_macros:
+        return nutrition_candidate_rank(candidate, user_feedback)
+
+    current = round_nutrition_totals(total_daily)
+    calories = safe_float(candidate.get("calories"))
+    protein = safe_float(candidate.get("protein"))
+    carbs = safe_float(candidate.get("carbs"))
+    fat = safe_float(candidate.get("fat"))
+    name = normalize_term(candidate.get("name"))
+    liked_foods = [normalize_term(food) for food in as_list(user_feedback.get("liked_foods"))]
+    retrieved_score = safe_float(candidate.get("score"), 0.0) or 0.0
+
+    target_protein = safe_float(target_macros.get("protein_g"))
+    target_carbs = safe_float(target_macros.get("carbs_g"))
+    target_fat = safe_float(target_macros.get("fat_g"))
+    target_calories = safe_float(target_calories)
+    used_names = used_names or set()
+    is_nut = is_nutrition_nut_candidate(candidate)
+
+    before_deficits = {
+        "calories": max(target_calories - current["calories"], 0.0),
+        "protein": max(target_protein - current["protein"], 0.0),
+        "carbs": max(target_carbs - current["carbs"], 0.0),
+        "fat": max(target_fat - current["fat"], 0.0),
+    }
+    after_deficits = {
+        "calories": max(target_calories - (current["calories"] + calories), 0.0),
+        "protein": max(target_protein - (current["protein"] + protein), 0.0),
+        "carbs": max(target_carbs - (current["carbs"] + carbs), 0.0),
+        "fat": max(target_fat - (current["fat"] + fat), 0.0),
+    }
+
+    improvement = 0.0
+    improvement += (before_deficits["calories"] - after_deficits["calories"]) / 80
+    improvement += (before_deficits["protein"] - after_deficits["protein"]) / 8
+    improvement += (before_deficits["carbs"] - after_deficits["carbs"]) / 8
+    improvement += (before_deficits["fat"] - after_deficits["fat"]) / 3
+
+    if any(liked and liked in name for liked in liked_foods):
+        improvement += 5
+    if before_deficits["carbs"] > 30 and carbs >= 15:
+        improvement += 2
+    if before_deficits["fat"] > 8 and fat >= 5:
+        improvement += 1.5
+    if before_deficits["protein"] <= 10 and protein > 35:
+        improvement -= 1
+
+    overage_penalty = 0.0
+    overage_penalty += max((current["protein"] + protein) - (target_protein * 1.25), 0.0) / 10
+    overage_penalty += max((current["fat"] + fat) - target_fat, 0.0) / 2
+    overage_penalty += max((current["fat"] + fat) - (target_fat * 1.25), 0.0) / 5
+    overage_penalty += max((current["calories"] + calories) - (target_calories * 1.1), 0.0) / 100
+
+    if current["fat"] >= (target_fat * 0.85):
+        overage_penalty += max(fat - 6, 0.0) / 2
+    elif fat > max(before_deficits["fat"] * 1.15, 12):
+        overage_penalty += (fat - before_deficits["fat"]) / 3
+
+    if is_nut:
+        if current["fat"] >= (target_fat * 0.70):
+            overage_penalty += 8
+        if has_nutrition_nut_item(used_names):
+            overage_penalty += 12
+        if before_deficits["carbs"] > 20 or before_deficits["protein"] > 10:
+            overage_penalty += 12
+        if "butter" in name:
+            overage_penalty += 4
+
+    if carbs >= 20 and before_deficits["carbs"] > 30 and fat <= 12:
+        improvement += 3
+    if protein >= 20 and before_deficits["protein"] > 15 and fat <= 12:
+        improvement += 2
+
+    score = improvement + retrieved_score - overage_penalty
+    return (-score, abs(after_deficits["calories"]), safe_str(candidate.get("name")).lower())
+
+def find_safe_nutrition_replacement(
+    retrieved_items,
+    used_source_ids,
+    used_names,
+    blocked_terms,
+    user_feedback,
+    total_daily=None,
+    target_macros=None,
+    target_calories=None,
+):
+    ranked_candidates = []
+    for item in retrieved_items or []:
+        candidate = retrieved_food_to_candidate(item)
+        if not candidate:
+            continue
+        candidate_id = str(candidate.get("source_id"))
+        candidate_name = normalize_term(candidate.get("name"))
+        if candidate_id in used_source_ids or candidate_name in used_names:
+            continue
+        if food_matches_restrictions(candidate.get("name"), blocked_terms):
+            continue
+        ranked_candidates.append((
+            nutrition_macro_fill_rank(
+                candidate,
+                user_feedback,
+                total_daily=total_daily,
+                target_macros=target_macros,
+                target_calories=target_calories,
+                used_names=used_names,
+            ),
+            candidate,
+        ))
+
+    if not ranked_candidates:
+        return None
+
+    ranked_candidates.sort(key=lambda item: item[0])
+    return ranked_candidates[0][1]
+
+def nutrition_item_has_macro_data(item):
+    if not isinstance(item, dict):
+        return False
+    return any(safe_float(item.get(key), 0.0) > 0 for key in ["calories", "protein", "carbs", "fat"])
+
+def find_matching_retrieved_food(item_name, retrieved_items, blocked_terms):
+    item_name_norm = normalize_term(item_name)
+    if not item_name_norm:
+        return None
+
+    ranked_candidates = []
+    for item in retrieved_items or []:
+        candidate = retrieved_food_to_candidate(item)
+        if not candidate:
+            continue
+        candidate_name = normalize_term(candidate.get("name"))
+        if food_matches_restrictions(candidate.get("name"), blocked_terms):
+            continue
+        if candidate_name == item_name_norm:
+            match_rank = 0
+        elif item_name_norm in candidate_name or candidate_name in item_name_norm:
+            match_rank = 1
+        else:
+            item_tokens = {token for token in item_name_norm.split() if len(token) > 3}
+            candidate_tokens = {token for token in candidate_name.split() if len(token) > 3}
+            if not item_tokens.intersection(candidate_tokens):
+                continue
+            match_rank = 2
+        ranked_candidates.append((match_rank, nutrition_candidate_rank(candidate, {}), candidate))
+
+    if not ranked_candidates:
+        return None
+
+    ranked_candidates.sort(key=lambda item: item[0:2])
+    return ranked_candidates[0][2]
+
+def enrich_existing_nutrition_item_from_retrieval(item, retrieved_items, blocked_terms):
+    if not isinstance(item, dict) or item.get("source_id") not in [None, ""]:
+        return item, None
+    if nutrition_item_has_macro_data(item):
+        return item, None
+
+    candidate = find_matching_retrieved_food(item.get("name"), retrieved_items, blocked_terms)
+    if not candidate:
+        return item, None
+
+    enriched_item = {
+        "food_id": candidate["food_id"],
+        "name": candidate["name"],
+        "serving_size": candidate.get("serving_size"),
+        "quantity": item.get("quantity", 1),
+        "calories": candidate["calories"],
+        "protein": candidate["protein"],
+        "carbs": candidate["carbs"],
+        "fat": candidate["fat"],
+        "reason": "Matched existing unsourced food to retrieved nutrition data.",
+        "source_id": candidate["source_id"],
+    }
+    return enriched_item, candidate
+
+def nutrition_totals_need_fallback_fill(total_daily, target_macros, target_calorie_floor, target_calories):
+    if not target_macros or not target_calories:
+        return False
+    if safe_float(total_daily.get("calories")) >= (target_calories * 1.1):
+        return False
+    if safe_float(total_daily.get("calories")) < target_calorie_floor:
+        return True
+    if safe_float(total_daily.get("protein")) < (safe_float(target_macros.get("protein_g")) * 0.85):
+        return True
+    if safe_float(total_daily.get("carbs")) < (safe_float(target_macros.get("carbs_g")) * 0.60):
+        return True
+    if safe_float(total_daily.get("fat")) < (safe_float(target_macros.get("fat_g")) * 0.60):
+        return True
+    return False
+
+def subtract_nutrition_item_from_totals(total_daily, item):
+    quantity = nutrition_item_quantity_number(item)
+    return round_nutrition_totals({
+        "calories": safe_float(total_daily.get("calories")) - (safe_float(item.get("calories")) * quantity),
+        "protein": safe_float(total_daily.get("protein")) - (safe_float(item.get("protein")) * quantity),
+        "carbs": safe_float(total_daily.get("carbs")) - (safe_float(item.get("carbs")) * quantity),
+        "fat": safe_float(total_daily.get("fat")) - (safe_float(item.get("fat")) * quantity),
+    })
+
+def nutrition_excess_protein_removal_rank(item, occurrence_count):
+    name = normalize_term(item.get("name"))
+    protein = safe_float(item.get("protein"))
+    carbs = safe_float(item.get("carbs"))
+    fat = safe_float(item.get("fat"))
+    duplicate_bonus = 30 if occurrence_count > 1 else 0
+    added_bonus = 15 if "added from retrieved foods" in normalize_term(item.get("reason")) else 0
+    lean_protein_bonus = 10 if protein >= 20 and carbs <= 5 and fat <= 8 else 0
+    return -(
+        protein
+        + duplicate_bonus
+        + added_bonus
+        + lean_protein_bonus
+        - (carbs * 0.15)
+        - (fat * 0.1)
+    ), name
+
+def trim_excess_nutrition_protein(daily_meals, target_macros, target_calories):
+    if not target_macros or not target_calories:
+        return [], []
+
+    target_protein = safe_float(target_macros.get("protein_g"))
+    if target_protein <= 0:
+        return [], []
+
+    total_daily = recalculate_nutrition_daily_totals(daily_meals)
+    protein_ceiling = target_protein * 1.30
+    protein_floor = target_protein * 0.85
+    calorie_floor = safe_float(target_calories) * 0.75
+    if total_daily["protein"] <= protein_ceiling:
+        return [], []
+
+    changes = []
+    warnings = []
+
+    while total_daily["protein"] > protein_ceiling:
+        name_counts = {}
+        for meal in daily_meals:
+            for item in meal.get("items", []) or []:
+                name = normalize_term(item.get("name"))
+                if name:
+                    name_counts[name] = name_counts.get(name, 0) + 1
+
+        candidates = []
+        for meal_index, meal in enumerate(daily_meals):
+            items = meal.get("items", []) or []
+            if len(items) <= 1:
+                continue
+            for item_index, item in enumerate(items):
+                if not isinstance(item, dict):
+                    continue
+                if nutrition_source_id_from_item(item) is None:
+                    continue
+                if safe_float(item.get("protein")) < 10:
+                    continue
+
+                after = subtract_nutrition_item_from_totals(total_daily, item)
+                if after["calories"] < calorie_floor:
+                    continue
+                if after["protein"] < protein_floor:
+                    continue
+                rank = nutrition_excess_protein_removal_rank(
+                    item,
+                    name_counts.get(normalize_term(item.get("name")), 1),
+                )
+                candidates.append((rank, meal_index, item_index, item, after))
+
+        if not candidates:
+            warnings.append(
+                f"Protein remains above target because reducing more foods would drop calories below {calorie_floor:g} or protein below {protein_floor:g}."
+            )
+            break
+
+        candidates.sort(key=lambda candidate: candidate[0])
+        _, meal_index, item_index, item, after = candidates[0]
+        removed_name = safe_str(item.get("name"), "high-protein food")
+        daily_meals[meal_index]["items"].pop(item_index)
+        total_daily = after
+        changes.append(
+            f"Removed '{removed_name}' to keep protein closer to the requested target."
+        )
+
+    return changes, warnings
+
+def fetch_retrieved_items_for_modify_nutrition_guard(
+    request: SmartModifyNutritionRequest,
+    user_feedback: Dict[str, Any],
+):
+    try:
+        retrieval_query = build_modify_nutrition_rag_search_query(request, user_feedback)
+        results = search_nutrition(retrieval_query, n_results=30)
+        return unpack_chroma_results(deduplicate_food_results_for_prompt(results))
+    except Exception as error:
+        log_nutrition_rag_exception("modify_nutrition_guard_retrieval", error)
+        return []
+
+def nutrition_generation_guard_feedback(request: GenerateNutritionRequest):
+    feedback = model_to_plain_dict(request.preferences) if request.preferences else {}
+    if request.target_macros:
+        feedback["target_macros"] = model_to_plain_dict(request.target_macros)
+    if request.user_summary.goal and not feedback.get("goal"):
+        feedback["goal"] = request.user_summary.goal
+    if "allergies" in feedback and not feedback.get("food_allergies"):
+        feedback["food_allergies"] = feedback.get("allergies")
+    if "food_allergies" in feedback and not feedback.get("allergies"):
+        feedback["allergies"] = feedback.get("food_allergies")
+    for key in ["liked_foods", "disliked_foods"]:
+        if key in feedback:
+            feedback[key] = as_list(feedback.get(key))
+    return feedback
+
+def fetch_retrieved_items_for_generate_nutrition_guard(request: GenerateNutritionRequest):
+    try:
+        retrieval_query = build_nutrition_rag_search_query(request)
+        results = search_nutrition(retrieval_query, n_results=30)
+        return unpack_chroma_results(deduplicate_food_results_for_prompt(results))
+    except Exception as error:
+        log_nutrition_rag_exception("generate_nutrition_guard_retrieval", error)
+        return []
+
+def apply_nutrition_safety_guard_to_plan_result(
+    result,
+    user_feedback: Dict[str, Any],
+    retrieved_items,
+):
+    if not isinstance(result, dict):
+        return result
+
+    guard_changes, guard_warnings, guard_recommendations, guard_sources = (
+        apply_nutrition_safety_guard_to_modified_plan(
+            result,
+            user_feedback,
+            retrieved_items,
+        )
+    )
+    daily_meals = extract_nutrition_daily_meals(result)
+    result["changes_summary"] = unique_strings(
+        result.get("changes_summary"),
+        guard_changes,
+        limit=20,
+    )
+    result["recommendations"] = unique_strings(
+        result.get("recommendations"),
+        guard_recommendations,
+        limit=8,
+    )
+    result["allergy_warnings"] = unique_strings(
+        result.get("allergy_warnings"),
+        guard_warnings,
+    )
+    result["sources"] = merge_sources_for_used_nutrition_foods(
+        result.get("sources"),
+        guard_sources,
+        daily_meals,
+        retrieved_items=retrieved_items,
+    )
+    if isinstance(result.get("total_daily"), dict):
+        result["total_daily"] = result.get("total_daily")
+    if isinstance(result.get("macro_targets"), dict):
+        result["macro_targets"] = result.get("macro_targets")
+    return result
+
+def apply_nutrition_safety_guard_to_modified_plan(
+    modified_plan,
+    user_feedback: Dict[str, Any],
+    retrieved_items,
+):
+    if not isinstance(modified_plan, dict):
+        return [], [], [], []
+
+    daily_meals = []
+    for meal in extract_nutrition_daily_meals(modified_plan):
+        if not isinstance(meal, dict):
+            continue
+        daily_meals.append({
+            "meal": meal.get("meal") or meal.get("meal_type") or "Meal",
+            "items": meal.get("items") or meal.get("foods") or [],
+        })
+
+    blocked_terms = collect_blocked_terms(user_feedback)
+    allergies = as_list(first_present(user_feedback.get("food_allergies"), user_feedback.get("allergies")))
+    guard_changes = []
+    guard_warnings = []
+    guard_sources = []
+    added_meal_names = ensure_nutrition_meal_count(daily_meals, user_feedback)
+    if added_meal_names:
+        guard_changes.append(
+            f"Added meal slots to respect requested meal count: {', '.join(added_meal_names)}."
+        )
+
+    used_source_ids = used_nutrition_source_ids(daily_meals)
+    used_names = {
+        normalize_term(item.get("name"))
+        for meal in daily_meals
+        for item in meal.get("items", [])
+        if isinstance(item, dict) and item.get("name")
+    }
+
+    if allergies:
+        guard_warnings.append(
+            f"Food allergy noted: avoided foods conflicting with {', '.join(str(item) for item in allergies)}."
+        )
+
+    for meal in daily_meals:
+        safe_items = []
+        for item in meal.get("items", []) or []:
+            if not isinstance(item, dict):
+                continue
+            item_name = safe_str(item.get("name"), "restricted food")
+            if blocked_terms and food_matches_restrictions(item_name, blocked_terms):
+                replacement = find_safe_nutrition_replacement(
+                    retrieved_items,
+                    used_source_ids,
+                    used_names,
+                    blocked_terms,
+                    user_feedback,
+                )
+                if replacement:
+                    replacement_item = {
+                        "food_id": replacement["food_id"],
+                        "name": replacement["name"],
+                        "serving_size": replacement.get("serving_size"),
+                        "quantity": 1,
+                        "calories": replacement["calories"],
+                        "protein": replacement["protein"],
+                        "carbs": replacement["carbs"],
+                        "fat": replacement["fat"],
+                        "reason": f"Safety replacement for {item_name}: avoided allergy or disliked food conflict.",
+                        "source_id": replacement["source_id"],
+                    }
+                    safe_items.append(replacement_item)
+                    used_source_ids.add(str(replacement["source_id"]))
+                    used_names.add(normalize_term(replacement["name"]))
+                    guard_sources.append({
+                        "source_id": replacement["source_id"],
+                        "source_table": "foods",
+                        "source_name": replacement["name"],
+                        "score": replacement.get("score"),
+                        "reason_used": "Used by nutrition safety guard as a safer retrieved replacement.",
+                    })
+                    guard_changes.append(
+                        f"Replaced '{item_name}' with '{replacement['name']}' to avoid allergy or disliked food conflict."
+                    )
+                else:
+                    guard_changes.append(
+                        f"Removed '{item_name}' because it conflicts with allergy or disliked food restrictions."
+                    )
+                    guard_warnings.append(
+                        f"Removed '{item_name}' because no safe retrieved replacement was available."
+                    )
+                continue
+
+            enriched_item, matched_candidate = enrich_existing_nutrition_item_from_retrieval(
+                item,
+                retrieved_items,
+                blocked_terms,
+            )
+            if matched_candidate:
+                safe_items.append(enriched_item)
+                used_source_ids.add(str(matched_candidate["source_id"]))
+                used_names.add(normalize_term(matched_candidate["name"]))
+                guard_sources.append({
+                    "source_id": matched_candidate["source_id"],
+                    "source_table": "foods",
+                    "source_name": matched_candidate["name"],
+                    "score": matched_candidate.get("score"),
+                    "reason_used": "Matched existing unsourced food to retrieved nutrition data.",
+                })
+                guard_changes.append(
+                    f"Matched existing '{item_name}' to retrieved food '{matched_candidate['name']}' for nutrition totals."
+                )
+            else:
+                safe_items.append(item)
+
+        meal["items"] = safe_items
+
+    normalized_target_macros = normalize_nutrition_target_macros(user_feedback.get("target_macros"))
+    estimated_target_calories = estimate_calories_from_macros(normalized_target_macros)
+    target_calorie_floor = estimated_target_calories * 0.75 if estimated_target_calories else None
+    if normalized_target_macros:
+        modified_plan["macro_targets"] = normalized_target_macros
+    if estimated_target_calories:
+        modified_plan["daily_calorie_target"] = estimated_target_calories
+
+    if daily_meals and estimated_target_calories:
+        total_daily = recalculate_nutrition_daily_totals(daily_meals)
+        additions = 0
+        while (
+            nutrition_totals_need_fallback_fill(
+                total_daily,
+                normalized_target_macros,
+                target_calorie_floor,
+                estimated_target_calories,
+            )
+            and additions < 12
+        ):
+            replacement = find_safe_nutrition_replacement(
+                retrieved_items,
+                used_source_ids,
+                used_names,
+                blocked_terms,
+                user_feedback,
+                total_daily=total_daily,
+                target_macros=normalized_target_macros,
+                target_calories=estimated_target_calories,
+            )
+            if not replacement:
+                break
+
+            added_item = {
+                "food_id": replacement["food_id"],
+                "name": replacement["name"],
+                "serving_size": replacement.get("serving_size"),
+                "quantity": 1,
+                "calories": replacement["calories"],
+                "protein": replacement["protein"],
+                "carbs": replacement["carbs"],
+                "fat": replacement["fat"],
+                "reason": "Added from retrieved foods to keep modified nutrition totals closer to the requested target.",
+                "source_id": replacement["source_id"],
+            }
+            target_meal = select_nutrition_meal_for_addition(daily_meals)
+            if target_meal is None:
+                break
+            target_meal.setdefault("items", []).append(added_item)
+            used_source_ids.add(str(replacement["source_id"]))
+            used_names.add(normalize_term(replacement["name"]))
+            guard_sources.append({
+                "source_id": replacement["source_id"],
+                "source_table": "foods",
+                "source_name": replacement["name"],
+                "score": replacement.get("score"),
+                "reason_used": "Added by nutrition safety guard to keep totals closer to target.",
+            })
+            guard_changes.append(
+                f"Added '{replacement['name']}' to keep nutrition totals closer to the requested target."
+            )
+            total_daily = recalculate_nutrition_daily_totals(daily_meals)
+            additions += 1
+
+        if nutrition_totals_need_fallback_fill(
+            total_daily,
+            normalized_target_macros,
+            target_calorie_floor,
+            estimated_target_calories,
+        ):
+            limited_message = (
+                "Macro completion was limited by available safe retrieved foods; "
+                f"fallback calories reached {total_daily['calories']:g} of target {estimated_target_calories:g}."
+            )
+            guard_changes.append(limited_message)
+            guard_warnings.append(limited_message)
+
+        trim_changes, trim_warnings = trim_excess_nutrition_protein(
+            daily_meals,
+            normalized_target_macros,
+            estimated_target_calories,
+        )
+        guard_changes.extend(trim_changes)
+        guard_warnings.extend(trim_warnings)
+
+    total_daily = recalculate_nutrition_daily_totals(daily_meals)
+    modified_plan["daily_meals"] = daily_meals
+    modified_plan["total_daily"] = total_daily
+    return guard_changes, guard_warnings, [], guard_sources
+
+def apply_nutrition_safety_guard_to_legacy_modify_result(
+    result,
+    request: SmartModifyNutritionRequest,
+    user_feedback: Dict[str, Any],
+):
+    if not isinstance(result, dict):
+        return result
+
+    modified_plan = result.get("modified_plan")
+    if not isinstance(modified_plan, dict):
+        return result
+
+    retrieved_items = fetch_retrieved_items_for_modify_nutrition_guard(request, user_feedback)
+    guard_changes, guard_warnings, guard_recommendations, guard_sources = (
+        apply_nutrition_safety_guard_to_modified_plan(
+            modified_plan,
+            user_feedback,
+            retrieved_items,
+        )
+    )
+    daily_meals = extract_nutrition_daily_meals(modified_plan)
+    result["changes_summary"] = unique_strings(
+        guard_changes,
+        result.get("changes_summary"),
+        limit=20,
+    )
+    result["recommendations"] = unique_strings(
+        result.get("recommendations"),
+        guard_recommendations,
+        limit=8,
+    )
+    result["allergy_warnings"] = unique_strings(
+        guard_warnings,
+        result.get("allergy_warnings"),
+    )
+    result["sources"] = merge_sources_for_used_nutrition_foods(
+        result.get("sources"),
+        guard_sources,
+        daily_meals,
+        retrieved_items=retrieved_items,
+    )
+    if isinstance(modified_plan.get("total_daily"), dict):
+        result["total_daily"] = modified_plan.get("total_daily")
+    if isinstance(modified_plan.get("macro_targets"), dict):
+        result["macro_targets"] = modified_plan.get("macro_targets")
+    if modified_plan.get("daily_calorie_target") is not None:
+        result["daily_calorie_target"] = modified_plan.get("daily_calorie_target")
+    return result
+
+def validate_modified_nutrition_sources(daily_meals, retrieved_items):
+    retrieved_source_ids = {
+        str(source_id)
+        for item in retrieved_items or []
+        for source_id in [retrieved_food_source_id(item)]
+        if source_id is not None
+    }
+    for meal in daily_meals:
+        for item in meal.get("items", []) or []:
+            source_id = nutrition_source_id_from_item(item)
+            if source_id is None or str(source_id) not in retrieved_source_ids:
+                raise RAGGenerationError(
+                    "rag_hallucinated_source_id",
+                    f"Modified nutrition response used non-retrieved food source_id {source_id}",
+                )
+
+def modified_nutrition_rag_response_to_legacy_response(
+    rag_response,
+    request: SmartModifyNutritionRequest,
+    user_feedback: Dict[str, Any],
+    retrieved_items=None,
+):
+    daily_meals = []
+    for meal in rag_response.modified_plan.daily_meals:
+        items = [nutrition_food_to_legacy_item(food) for food in meal.foods]
+        daily_meals.append({
+            "meal": meal.meal,
+            "items": items,
+        })
+
+    if not daily_meals:
+        raise ValueError("LLM response did not include modified nutrition meals")
+    if not any(meal["items"] for meal in daily_meals):
+        raise ValueError("LLM response did not include usable modified nutrition foods")
+
+    validate_modified_nutrition_sources(daily_meals, retrieved_items or [])
+
+    modified_plan = copy.deepcopy(request.current_plan or {})
+    if not isinstance(modified_plan, dict):
+        modified_plan = {}
+    modified_plan["daily_meals"] = daily_meals
+
+    guard_changes, guard_warnings, guard_recommendations, guard_sources = (
+        apply_nutrition_safety_guard_to_modified_plan(
+            modified_plan,
+            user_feedback,
+            retrieved_items or [],
+        )
+    )
+    daily_meals = extract_nutrition_daily_meals(modified_plan)
+    total_daily = recalculate_nutrition_daily_totals(daily_meals)
+    modified_plan["total_daily"] = total_daily
+
+    normalized_target_macros = modified_nutrition_target_macros(request, user_feedback)
+    estimated_target_calories = estimate_calories_from_macros(normalized_target_macros)
+    if normalized_target_macros:
+        modified_plan["macro_targets"] = normalized_target_macros
+    elif rag_response.modified_plan.macro_targets:
+        modified_plan["macro_targets"] = model_to_plain_dict(rag_response.modified_plan.macro_targets)
+    if estimated_target_calories or rag_response.modified_plan.daily_calorie_target:
+        modified_plan["daily_calorie_target"] = estimated_target_calories or rag_response.modified_plan.daily_calorie_target
+
+    if estimated_target_calories and total_daily["calories"] < (estimated_target_calories * 0.55):
+        raise RAGGenerationError(
+            "nutrition_totals_too_low",
+            (
+                f"Modified nutrition totals too low: recalculated calories {total_daily['calories']:g} "
+                f"below 55% of estimated target calories {estimated_target_calories:g}"
+            ),
+        )
+
+    changes_summary = unique_strings(
+        guard_changes,
+        rag_response.changes_summary or [rag_response.summary],
+        limit=20,
+    )
+    recommendations = unique_strings(
+        rag_response.recommendations,
+        guard_recommendations,
+        limit=8,
+    )
+    allergy_warnings = unique_strings(
+        guard_warnings,
+        rag_response.allergy_warnings,
+    )
+    sources = merge_sources_for_used_nutrition_foods(
+        rag_response.sources,
+        guard_sources,
+        daily_meals,
+        retrieved_items=retrieved_items or [],
+    )
+
+    return {
+        "status": rag_response.status,
+        "plan_id": nutrition_plan_id_from_request(request),
+        "version": next_nutrition_plan_version(request.current_plan),
+        "changes_summary": changes_summary,
+        "modified_plan": modified_plan,
+        "recommendations": recommendations,
+        "total_daily": total_daily,
+        "daily_calorie_target": modified_plan.get("daily_calorie_target"),
+        "macro_targets": modified_plan.get("macro_targets"),
+        "generation_mode": "rag",
+        "rag_summary": rag_response.summary,
+        "sources": sources,
+        "allergy_warnings": allergy_warnings,
+    }
+
+def generate_modified_nutrition_plan_rag(request: SmartModifyNutritionRequest):
+    user_feedback = resolve_nutrition_modification_feedback(request)
+    retrieval_query = build_modify_nutrition_rag_search_query(request, user_feedback)
+    rag_logger.info("modify_nutrition_rag.retrieval_start user_id=%s", request.user_summary.user_id)
+
+    try:
+        results = search_nutrition(retrieval_query, n_results=30)
+        retrieved_items = unpack_chroma_results(results)
+    except Exception as error:
+        log_nutrition_rag_exception("modify_nutrition_retrieval", error)
+        raise RAGGenerationError("rag_generation_failed", sanitize_rag_error_message(error), error) from error
+
+    rag_logger.info("modify_nutrition_rag.retrieval_done retrieved_foods=%s", len(retrieved_items))
+    if not retrieved_items:
+        message = "No retrieved foods found for RAG nutrition modification"
+        rag_logger.warning("modify_nutrition_rag.retrieval_empty: %s", message)
+        raise RAGGenerationError("no_retrieved_foods", message)
+
+    prompt_results = deduplicate_food_results_for_prompt(results)
+    deduped_items = unpack_chroma_results(prompt_results)
+    if not deduped_items:
+        message = "No retrieved foods found for RAG nutrition modification"
+        rag_logger.warning("modify_nutrition_rag.dedup_empty: %s", message)
+        raise RAGGenerationError("no_retrieved_foods", message)
+
+    food_context = build_food_context(prompt_results)
+    if not food_context.strip():
+        message = "No retrieved foods found for RAG nutrition modification"
+        rag_logger.warning("modify_nutrition_rag.context_empty: %s", message)
+        raise RAGGenerationError("no_retrieved_foods", message)
+
+    user_payload = build_modify_nutrition_user_payload(request, user_feedback, retrieval_query)
+    messages = build_modify_nutrition_plan_prompt(user_payload, food_context)
+    rag_logger.info(
+        "modify_nutrition_rag.prompt_built message_count=%s context_chars=%s",
+        len(messages),
+        len(food_context),
+    )
+
+    try:
+        rag_logger.info("modify_nutrition_rag.llm_call_start provider=%s", settings.LLM_PROVIDER)
+        llm_text = call_llm_chat(
+            messages,
+            response_schema=modified_nutrition_plan_response_schema(),
+        )
+        rag_logger.info(
+            "modify_nutrition_rag.llm_call_done provider=%s response_chars=%s",
+            settings.LLM_PROVIDER,
+            len(llm_text or ""),
+        )
+    except Exception as error:
+        log_nutrition_rag_exception("modify_nutrition_llm_call", error)
+        category = classify_llm_error(error)
+        raise RAGGenerationError(category, sanitize_rag_error_message(error), error) from error
+
+    try:
+        rag_response = parse_modified_nutrition_plan_response(llm_text)
+        rag_logger.info("modify_nutrition_rag.parse_done")
+    except ValidationError as error:
+        log_nutrition_rag_exception("modify_nutrition_parse_validation", error)
+        raise RAGGenerationError(
+            "rag_schema_validation_failed",
+            sanitize_rag_error_message(error),
+            error,
+        ) from error
+    except ValueError as error:
+        log_nutrition_rag_exception("modify_nutrition_parse_json", error)
+        raise RAGGenerationError("invalid_llm_json", sanitize_rag_error_message(error), error) from error
+    except Exception as error:
+        log_nutrition_rag_exception("modify_nutrition_parse_unknown", error)
+        raise RAGGenerationError("invalid_llm_json", sanitize_rag_error_message(error), error) from error
+
+    try:
+        response = modified_nutrition_rag_response_to_legacy_response(
+            rag_response,
+            request,
+            user_feedback,
+            retrieved_items=deduped_items,
+        )
+        rag_logger.info("modify_nutrition_rag.legacy_conversion_done")
+        return response
+    except RAGGenerationError:
+        raise
+    except Exception as error:
+        log_nutrition_rag_exception("modify_nutrition_legacy_conversion", error)
+        raise RAGGenerationError(
+            "rag_legacy_conversion_failed",
+            sanitize_rag_error_message(error),
+            error,
+        ) from error
+
+
 def analyze_nutrition_and_suggest_modifications(current_plan, user_feedback, search_func):
     modified_plan = copy.deepcopy(current_plan)
     changes_summary = []
     recommendations = []
 
-    disliked_foods = [str(x).strip() for x in user_feedback.get("disliked_foods", [])]
-    liked_foods = [normalize_term(x) for x in user_feedback.get("liked_foods", []) if normalize_term(x)]
-    blocked_terms = expand_blocked_terms(disliked_foods)
+    disliked_foods = [str(x).strip() for x in as_list(user_feedback.get("disliked_foods"))]
+    liked_foods = [normalize_term(x) for x in as_list(user_feedback.get("liked_foods")) if normalize_term(x)]
+    blocked_terms = collect_blocked_terms(user_feedback)
 
     goal = normalize_term(user_feedback.get("goal", "")).replace(" ", "_")
-    notes = normalize_term(user_feedback.get("notes", ""))
+    notes = normalize_term(
+        " ".join(
+            str(item)
+            for item in [
+                user_feedback.get("notes", ""),
+                user_feedback.get("modification_request", ""),
+            ]
+            if item
+        )
+    )
 
     if goal == "higher_protein":
         blocked_terms.update(
@@ -3164,6 +5261,7 @@ def analyze_nutrition_and_suggest_modifications(current_plan, user_feedback, sea
 
             suggested_foods.append({
                 "food_id": food_id,
+                "source_id": food_id,
                 "name": food_name,
                 "calories": calories,
                 "protein": protein,
@@ -3174,6 +5272,8 @@ def analyze_nutrition_and_suggest_modifications(current_plan, user_feedback, sea
 
             seen_ids.add(food_id)
             seen_names.add(food_name_l)
+
+    suggested_foods.sort(key=lambda food: nutrition_candidate_rank(food, user_feedback))
 
     used_names = set()
     total_daily = {"calories": 0.0, "protein": 0.0, "carbs": 0.0, "fat": 0.0}
@@ -3260,7 +5360,7 @@ def analyze_nutrition_and_suggest_modifications(current_plan, user_feedback, sea
 
     for meal in modified_plan.get("daily_meals", []):
         for item in meal.get("items", []):
-            quantity = float(item.get("quantity", 1) or 1)
+            quantity = nutrition_item_quantity_number(item)
             total_daily["calories"] += float(item.get("calories", 0) or 0) * quantity
             total_daily["protein"] += float(item.get("protein", 0) or 0) * quantity
             total_daily["carbs"] += float(item.get("carbs", 0) or 0) * quantity
@@ -3276,6 +5376,8 @@ def analyze_nutrition_and_suggest_modifications(current_plan, user_feedback, sea
         recommendations.append("Removed or reduced disliked foods where alternatives were available.")
     if notes:
         recommendations.append("Applied the user's nutrition notes where possible.")
+    if user_feedback.get("food_allergies") or user_feedback.get("allergies"):
+        recommendations.append("Avoided foods that conflict with the user's allergy notes.")
 
     return {
         "plan_id": current_plan.get("plan_id", "unknown"),
@@ -3289,15 +5391,30 @@ def analyze_nutrition_and_suggest_modifications(current_plan, user_feedback, sea
 @app.post("/modify-nutrition-plan")
 async def modify_nutrition_plan(request: SmartModifyNutritionRequest):
     try:
-        result = analyze_nutrition_and_suggest_modifications(
-            current_plan=request.current_plan,
-            user_feedback=request.user_feedback,
-            search_func=search_nutrition
-        )
-        return result
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        return generate_modified_nutrition_plan_rag(request)
+    except Exception as rag_error:
+        try:
+            user_feedback = resolve_nutrition_modification_feedback(request)
+            result = analyze_nutrition_and_suggest_modifications(
+                current_plan=request.current_plan,
+                user_feedback=user_feedback,
+                search_func=search_nutrition
+            )
+            result = apply_nutrition_safety_guard_to_legacy_modify_result(
+                result,
+                request,
+                user_feedback,
+            )
+            result["generation_mode"] = "fallback"
+            result["fallback_reason"] = safe_nutrition_fallback_reason(rag_error)
+            result.setdefault("status", "success")
+            if settings.DEBUG:
+                result["rag_debug_error_type"] = rag_debug_error_type(rag_error)
+                result["rag_debug_error_message"] = sanitize_rag_error_message(rag_error)
+            return result
+        except Exception as e:
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=str(e))
 
 def to_float_or_none(value):
     if isinstance(value, bool) or value is None:

@@ -1,12 +1,16 @@
 from typing import Any, Dict, List, Optional
 
 import httpx
+import time
 
 from config import settings
 
 
 OPENROUTER_CHAT_COMPLETIONS_URL = "https://openrouter.ai/api/v1/chat/completions"
 GEMINI_GENERATE_CONTENT_URL = "https://generativelanguage.googleapis.com/v1beta/{model_path}:generateContent"
+GEMINI_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+GEMINI_MAX_RETRIES = 2
+GEMINI_RETRY_BASE_DELAY_SECONDS = 1.0
 
 
 def call_openrouter_chat(
@@ -136,6 +140,20 @@ def _messages_to_gemini_payload(
     return payload
 
 
+def _gemini_error_detail(response: httpx.Response) -> str:
+    error_detail = response.text
+    try:
+        error_json = response.json()
+        error_detail = str(error_json.get("error") or error_json)
+    except ValueError:
+        pass
+
+    if settings.GEMINI_API_KEY:
+        error_detail = error_detail.replace(settings.GEMINI_API_KEY, "[redacted]")
+
+    return error_detail
+
+
 def call_gemini_chat(
     messages: List[Dict[str, str]],
     temperature: float = 0.2,
@@ -164,30 +182,46 @@ def call_gemini_chat(
     if model.lower().startswith("gemini-2.5"):
         payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0}
 
-    try:
-        with httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
-            response = client.post(
-                url,
-                params={"key": settings.GEMINI_API_KEY},
-                headers={"Content-Type": "application/json"},
-                json=payload,
-            )
-    except httpx.TimeoutException as exc:
-        raise RuntimeError("Gemini request timed out") from exc
-    except httpx.RequestError as exc:
-        raise RuntimeError(f"Gemini request failed: {exc}") from exc
+    attempts = GEMINI_MAX_RETRIES + 1
+    last_response: Optional[httpx.Response] = None
+
+    with httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
+        for attempt_index in range(attempts):
+            if attempt_index > 0:
+                delay = GEMINI_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt_index - 1))
+                time.sleep(delay)
+
+            try:
+                response = client.post(
+                    url,
+                    params={"key": settings.GEMINI_API_KEY},
+                    headers={"Content-Type": "application/json"},
+                    json=payload,
+                )
+            except httpx.TimeoutException as exc:
+                raise RuntimeError("Gemini request timed out") from exc
+            except httpx.RequestError as exc:
+                raise RuntimeError(f"Gemini request failed: {exc}") from exc
+
+            last_response = response
+            if (
+                response.status_code in GEMINI_RETRY_STATUS_CODES
+                and attempt_index < GEMINI_MAX_RETRIES
+            ):
+                continue
+            break
+
+    response = last_response
+    if response is None:
+        raise RuntimeError("Gemini request failed before receiving a response")
 
     if response.status_code >= 400:
-        error_detail = response.text
-        try:
-            error_json = response.json()
-            error_detail = str(error_json.get("error") or error_json)
-        except ValueError:
-            pass
-        if settings.GEMINI_API_KEY:
-            error_detail = error_detail.replace(settings.GEMINI_API_KEY, "[redacted]")
+        error_detail = _gemini_error_detail(response)
+        retry_note = ""
+        if response.status_code in GEMINI_RETRY_STATUS_CODES:
+            retry_note = f" after {attempts} attempts"
         raise RuntimeError(
-            f"Gemini request failed with status {response.status_code}: {error_detail}"
+            f"Gemini request failed with status {response.status_code}{retry_note}: {error_detail}"
         )
 
     try:

@@ -2,7 +2,12 @@ import json
 import re
 from typing import Any, Dict
 
-from rag_schemas import NutritionPlanRAGResponse, TrainingPlanRAGResponse
+from rag_schemas import (
+    ModifiedNutritionPlanRAGResponse,
+    ModifiedTrainingPlanRAGResponse,
+    NutritionPlanRAGResponse,
+    TrainingPlanRAGResponse,
+)
 
 
 def _ensure_json_object(value: Any) -> Dict[str, Any]:
@@ -46,8 +51,50 @@ def parse_training_plan_response(text: str) -> TrainingPlanRAGResponse:
     return TrainingPlanRAGResponse.model_validate(data)
 
 
-def normalize_nutrition_food_source_ids(data: Dict[str, Any]) -> Dict[str, Any]:
-    meals = data.get("meals", [])
+def normalize_training_exercise_source_ids(data: Dict[str, Any], plan_key: str = "days") -> Dict[str, Any]:
+    if plan_key == "modified_plan":
+        plan = data.get("modified_plan", {})
+        days = plan.get("schedule", []) if isinstance(plan, dict) else []
+    else:
+        days = data.get(plan_key, [])
+
+    if not isinstance(days, list):
+        return data
+
+    for day in days:
+        if not isinstance(day, dict):
+            continue
+        exercises = day.get("exercises", [])
+        if not isinstance(exercises, list):
+            continue
+        for exercise in exercises:
+            if not isinstance(exercise, dict):
+                continue
+            if exercise.get("source_id") in [None, ""] and exercise.get("exercise_id") not in [None, ""]:
+                exercise["source_id"] = exercise["exercise_id"]
+
+    return data
+
+
+def parse_modified_training_plan_response(text: str) -> ModifiedTrainingPlanRAGResponse:
+    data = extract_json_object(text)
+    data = normalize_training_exercise_source_ids(data, plan_key="modified_plan")
+    return ModifiedTrainingPlanRAGResponse.model_validate(data)
+
+
+def normalize_nutrition_food_source_ids(data: Dict[str, Any], plan_key: str = "meals") -> Dict[str, Any]:
+    if plan_key == "modified_plan":
+        plan = data.get("modified_plan", {})
+        if isinstance(plan, dict):
+            meals = plan.get("daily_meals", [])
+            if not meals and isinstance(plan.get("meals"), list):
+                meals = plan.get("meals", [])
+                plan["daily_meals"] = meals
+        else:
+            meals = []
+    else:
+        meals = data.get("meals", [])
+
     if not isinstance(meals, list):
         return data
 
@@ -55,6 +102,9 @@ def normalize_nutrition_food_source_ids(data: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(meal, dict):
             continue
         foods = meal.get("foods", [])
+        if not foods and isinstance(meal.get("items"), list):
+            foods = meal.get("items", [])
+            meal["foods"] = foods
         if not isinstance(foods, list):
             continue
         for food in foods:
@@ -70,3 +120,9 @@ def parse_nutrition_plan_response(text: str) -> NutritionPlanRAGResponse:
     data = extract_json_object(text)
     data = normalize_nutrition_food_source_ids(data)
     return NutritionPlanRAGResponse.model_validate(data)
+
+
+def parse_modified_nutrition_plan_response(text: str) -> ModifiedNutritionPlanRAGResponse:
+    data = extract_json_object(text)
+    data = normalize_nutrition_food_source_ids(data, plan_key="modified_plan")
+    return ModifiedNutritionPlanRAGResponse.model_validate(data)

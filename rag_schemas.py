@@ -49,6 +49,26 @@ class TrainingPlanRAGResponse(BaseModel):
     sources: List[RAGSource] = Field(default_factory=list)
 
 
+class ModifiedTrainingPlanData(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    schedule: List[TrainingDayRAGItem] = Field(default_factory=list)
+
+
+class ModifiedTrainingPlanRAGResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    status: str
+    plan_type: str
+    user_id: FlexibleId
+    summary: str
+    modified_plan: ModifiedTrainingPlanData
+    changes_summary: List[str] = Field(default_factory=list)
+    recommendations: List[str] = Field(default_factory=list)
+    injury_warnings: List[str] = Field(default_factory=list)
+    sources: List[RAGSource] = Field(default_factory=list)
+
+
 class MacroTargets(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -79,6 +99,15 @@ class NutritionMealRAGItem(BaseModel):
     foods: List[NutritionFoodRAGItem] = Field(default_factory=list)
 
 
+class NutritionTotals(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    calories: float
+    protein: float
+    carbs: float
+    fat: float
+
+
 class NutritionPlanRAGResponse(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -88,6 +117,29 @@ class NutritionPlanRAGResponse(BaseModel):
     daily_calorie_target: Optional[float] = None
     macro_targets: MacroTargets
     meals: List[NutritionMealRAGItem] = Field(default_factory=list)
+    allergy_warnings: List[str] = Field(default_factory=list)
+    sources: List[RAGSource] = Field(default_factory=list)
+
+
+class ModifiedNutritionPlanData(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    daily_meals: List[NutritionMealRAGItem] = Field(default_factory=list)
+    total_daily: Optional[NutritionTotals] = None
+    daily_calorie_target: Optional[float] = None
+    macro_targets: Optional[MacroTargets] = None
+
+
+class ModifiedNutritionPlanRAGResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    status: str
+    plan_type: str
+    user_id: FlexibleId
+    summary: str
+    modified_plan: ModifiedNutritionPlanData
+    changes_summary: List[str] = Field(default_factory=list)
+    recommendations: List[str] = Field(default_factory=list)
     allergy_warnings: List[str] = Field(default_factory=list)
     sources: List[RAGSource] = Field(default_factory=list)
 
@@ -190,6 +242,87 @@ def training_plan_response_schema() -> Dict[str, Any]:
     )
 
 
+def modified_training_plan_response_schema() -> Dict[str, Any]:
+    """Gemini-compatible schema for modified training-plan responses."""
+    exercise_schema = _schema_type(
+        "OBJECT",
+        properties={
+            "exercise_id": _schema_type("INTEGER"),
+            "name": _schema_type("STRING"),
+            "sets": _schema_type("INTEGER"),
+            "reps": _schema_type("STRING"),
+            "rest_seconds": _schema_type("INTEGER"),
+            "intensity": _schema_type("STRING"),
+            "reason": _schema_type("STRING"),
+            "source_id": _schema_type("INTEGER"),
+        },
+        required=["exercise_id", "name", "sets", "reps", "reason", "source_id"],
+        propertyOrdering=[
+            "exercise_id",
+            "name",
+            "sets",
+            "reps",
+            "rest_seconds",
+            "intensity",
+            "reason",
+            "source_id",
+        ],
+    )
+    day_schema = _schema_type(
+        "OBJECT",
+        properties={
+            "day": _schema_type("STRING"),
+            "focus": _schema_type("STRING"),
+            "exercises": _schema_type("ARRAY", items=exercise_schema),
+        },
+        required=["day", "focus", "exercises"],
+        propertyOrdering=["day", "focus", "exercises"],
+    )
+    modified_plan_schema = _schema_type(
+        "OBJECT",
+        properties={
+            "schedule": _schema_type("ARRAY", items=day_schema),
+        },
+        required=["schedule"],
+        propertyOrdering=["schedule"],
+    )
+    return _schema_type(
+        "OBJECT",
+        properties={
+            "status": _schema_type("STRING"),
+            "plan_type": _schema_type("STRING", description="Use 'training_modification'."),
+            "user_id": _schema_type("INTEGER"),
+            "summary": _schema_type("STRING"),
+            "modified_plan": modified_plan_schema,
+            "changes_summary": _schema_type("ARRAY", items=_schema_type("STRING")),
+            "recommendations": _schema_type("ARRAY", items=_schema_type("STRING")),
+            "injury_warnings": _schema_type("ARRAY", items=_schema_type("STRING")),
+            "sources": _schema_type("ARRAY", items=_source_schema("exercises")),
+        },
+        required=[
+            "status",
+            "plan_type",
+            "user_id",
+            "summary",
+            "modified_plan",
+            "changes_summary",
+            "sources",
+            "injury_warnings",
+        ],
+        propertyOrdering=[
+            "status",
+            "plan_type",
+            "user_id",
+            "summary",
+            "modified_plan",
+            "changes_summary",
+            "recommendations",
+            "injury_warnings",
+            "sources",
+        ],
+    )
+
+
 def nutrition_plan_response_schema() -> Dict[str, Any]:
     """Gemini-compatible schema for NutritionPlanRAGResponse."""
     macro_schema = _schema_type(
@@ -278,6 +411,124 @@ def nutrition_plan_response_schema() -> Dict[str, Any]:
             "daily_calorie_target",
             "macro_targets",
             "meals",
+            "allergy_warnings",
+            "sources",
+        ],
+    )
+
+
+def modified_nutrition_plan_response_schema() -> Dict[str, Any]:
+    """Gemini-compatible schema for modified nutrition-plan responses."""
+    macro_schema = _schema_type(
+        "OBJECT",
+        properties={
+            "protein_g": _schema_type("NUMBER"),
+            "carbs_g": _schema_type("NUMBER"),
+            "fat_g": _schema_type("NUMBER"),
+        },
+        required=["protein_g", "carbs_g", "fat_g"],
+        propertyOrdering=["protein_g", "carbs_g", "fat_g"],
+    )
+    totals_schema = _schema_type(
+        "OBJECT",
+        properties={
+            "calories": _schema_type("NUMBER"),
+            "protein": _schema_type("NUMBER"),
+            "carbs": _schema_type("NUMBER"),
+            "fat": _schema_type("NUMBER"),
+        },
+        required=["calories", "protein", "carbs", "fat"],
+        propertyOrdering=["calories", "protein", "carbs", "fat"],
+    )
+    food_schema = _schema_type(
+        "OBJECT",
+        properties={
+            "food_id": _schema_type("INTEGER"),
+            "name": _schema_type("STRING"),
+            "serving_size": _schema_type("STRING"),
+            "quantity": _schema_type("NUMBER"),
+            "calories": _schema_type("NUMBER"),
+            "protein": _schema_type("NUMBER"),
+            "carbs": _schema_type("NUMBER"),
+            "fat": _schema_type("NUMBER"),
+            "reason": _schema_type("STRING"),
+            "source_id": _schema_type("INTEGER"),
+        },
+        required=[
+            "food_id",
+            "name",
+            "quantity",
+            "calories",
+            "protein",
+            "carbs",
+            "fat",
+            "reason",
+            "source_id",
+        ],
+        propertyOrdering=[
+            "food_id",
+            "name",
+            "serving_size",
+            "quantity",
+            "calories",
+            "protein",
+            "carbs",
+            "fat",
+            "reason",
+            "source_id",
+        ],
+    )
+    meal_schema = _schema_type(
+        "OBJECT",
+        properties={
+            "meal": _schema_type("STRING"),
+            "foods": _schema_type("ARRAY", items=food_schema),
+        },
+        required=["meal", "foods"],
+        propertyOrdering=["meal", "foods"],
+    )
+    modified_plan_schema = _schema_type(
+        "OBJECT",
+        properties={
+            "daily_meals": _schema_type("ARRAY", items=meal_schema),
+            "total_daily": totals_schema,
+            "daily_calorie_target": _schema_type("NUMBER"),
+            "macro_targets": macro_schema,
+        },
+        required=["daily_meals", "total_daily", "macro_targets"],
+        propertyOrdering=["daily_meals", "total_daily", "daily_calorie_target", "macro_targets"],
+    )
+    return _schema_type(
+        "OBJECT",
+        properties={
+            "status": _schema_type("STRING"),
+            "plan_type": _schema_type("STRING", description="Use 'nutrition_modification'."),
+            "user_id": _schema_type("INTEGER"),
+            "summary": _schema_type("STRING"),
+            "modified_plan": modified_plan_schema,
+            "changes_summary": _schema_type("ARRAY", items=_schema_type("STRING")),
+            "recommendations": _schema_type("ARRAY", items=_schema_type("STRING")),
+            "allergy_warnings": _schema_type("ARRAY", items=_schema_type("STRING")),
+            "sources": _schema_type("ARRAY", items=_source_schema("foods")),
+        },
+        required=[
+            "status",
+            "plan_type",
+            "user_id",
+            "summary",
+            "modified_plan",
+            "changes_summary",
+            "allergy_warnings",
+            "sources",
+        ],
+        propertyOrdering=[
+            "status",
+            "plan_type",
+            "user_id",
+            "summary",
+            "modified_plan",
+            "changes_summary",
+            "recommendations",
             "allergy_warnings",
             "sources",
         ],
