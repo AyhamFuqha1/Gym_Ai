@@ -75,6 +75,7 @@ def fetch_exercises_by_ids(ids=None):
             e.instructions,
             e.common_mistakes,
             e.video_url,
+            g.name AS exercise_category,
             g.muscle_group,
             g.description AS exercise_description,
             CONCAT(
@@ -107,10 +108,22 @@ def fetch_all_exercise_ids():
     conn.close()
     return [str(row['id']) for row in rows]
 
+def table_has_column(cursor, table_name, column_name):
+    cursor.execute("""
+        SELECT COUNT(*) AS column_count
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = %s
+          AND TABLE_NAME = %s
+          AND COLUMN_NAME = %s
+    """, (DB_CONFIG["database"], table_name, column_name))
+    row = cursor.fetchone()
+    return bool(row and int(row.get("column_count", 0)) > 0)
+
 def fetch_changed_exercises(since_time):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("""
+
+    base_query = """
         SELECT 
             e.id,
             e.name,
@@ -118,6 +131,7 @@ def fetch_changed_exercises(since_time):
             e.instructions,
             e.common_mistakes,
             e.video_url,
+            g.name AS exercise_category,
             g.muscle_group,
             g.description AS exercise_description,
             CONCAT(
@@ -130,8 +144,32 @@ def fetch_changed_exercises(since_time):
             ) AS embedding_text
         FROM exercises e
         JOIN general_exercises g ON e.general_exercise_id = g.id
-       
-    """)
+    """
+
+    where_clauses = []
+    params = []
+    try:
+        timestamp_checks = [
+            ("e", "exercises", "updated_at"),
+            ("e", "exercises", "created_at"),
+            ("g", "general_exercises", "updated_at"),
+            ("g", "general_exercises", "created_at"),
+        ]
+        for alias, table_name, column_name in timestamp_checks:
+            if table_has_column(cursor, table_name, column_name):
+                where_clauses.append(f"{alias}.{column_name} > %s")
+                params.append(since_time)
+    except Exception:
+        where_clauses = []
+        params = []
+
+    # Some older FitMind databases do not expose updated_at/created_at on
+    # exercise tables. In that case, fall back to scanning exercises so sync
+    # remains correct instead of silently missing changed records.
+    if where_clauses:
+        base_query += " WHERE (" + " OR ".join(where_clauses) + ")"
+
+    cursor.execute(base_query, params)
     rows = cursor.fetchall()
     conn.close()
     return rows
@@ -219,13 +257,380 @@ def fetch_changed_nutrition(since_time):
     return rows
 
 # =====================
-# 🧾 TEXT FORMAT
+# ITEM-LEVEL DOCUMENT STRATEGY
 # =====================
+# This service indexes structured database records, not long PDFs/articles.
+# One exercise row becomes one Chroma document and one food row becomes one
+# Chroma document. We intentionally do not use arbitrary character chunking.
+# Retrieval quality comes from deterministic, rich, structured item text.
+
+def safe_str(value, default=""):
+    if value is None:
+        return default
+    return str(value).strip()
+
+def safe_float(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+def csv_tags(tags):
+    cleaned = []
+    seen = set()
+    for tag in tags or []:
+        tag = normalize_label(tag)
+        if tag and tag not in seen:
+            seen.add(tag)
+            cleaned.append(tag)
+    return ",".join(cleaned)
+
+def normalize_label(value):
+    value = safe_str(value).lower()
+    value = value.replace("&", " and ")
+    value = re.sub(r"[_\-/]+", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+
+    aliases = {
+        "protien": "protein",
+        "protein": "protein",
+        "healty fat": "healthy_fat",
+        "healthy fat": "healthy_fat",
+        "healthy fats": "healthy_fat",
+        "vegetables": "vegetable",
+        "vegetable": "vegetable",
+        "fruits": "fruit",
+        "fruit": "fruit",
+        "carbohydrates": "carbohydrate",
+        "carbs": "carbohydrate",
+        "upper body": "upper_body",
+        "lower body": "lower_body",
+        "full body": "full_body",
+    }
+    if value in aliases:
+        return aliases[value]
+
+    value = re.sub(r"[^a-z0-9]+", "_", value)
+    value = re.sub(r"_+", "_", value).strip("_")
+    return value
+
+def normalize_food_category(category):
+    category = normalize_label(category)
+    aliases = {
+        "seafoods": "seafood",
+        "proteins": "protein",
+        "healthy_fats": "healthy_fat",
+        "healty_fat": "healthy_fat",
+    }
+    return aliases.get(category, category or "unknown")
+
+def infer_normalized_muscle_group(raw_group="", exercise_name="", category="", description=""):
+    checks = [
+        ("chest", ["chest", "bench press", "push up", "push-up", "fly", "pec", "crossover"]),
+        ("back", ["back", "row", "pulldown", "pull up", "pull-up", "lat"]),
+        ("shoulders", ["shoulder", "lateral raise", "front raise", "rear delt", "face pull", "arnold press"]),
+        ("biceps", ["bicep", "curl", "hammer curl", "concentration curl"]),
+        ("triceps", ["tricep", "pushdown", "kickback", "extension", "close grip", "dip"]),
+        ("legs", ["leg", "squat", "lunge", "deadlift", "hamstring", "quad", "calf", "step up"]),
+        ("core", ["core", "plank", "dead bug", "crunch", "knee raise", "mountain climber", "russian twist"]),
+        ("cardio", ["cardio", "jump rope", "burpee", "high knees", "jumping jack", "rowing machine"]),
+        ("arms", ["arms", "arm"]),
+    ]
+
+    specific_labels = {label for label, _ in checks}
+    generic_labels = {"upper_body", "lower_body", "full_body", "general"}
+
+    def direct_label(value):
+        normalized = normalize_label(value)
+        if normalized in specific_labels or normalized in generic_labels:
+            return normalized
+        return None
+
+    def keyword_match(text):
+        text = safe_str(text).lower()
+        if ("chest supported" in text or "chest-supported" in text) and "row" in text:
+            return "back"
+        for label, keywords in checks:
+            if any(keyword in text for keyword in keywords):
+                return label
+        return None
+
+    # Trust explicit DB/general-exercise labels before parsing the exercise
+    # name. This prevents names like "Chest Supported Row" from overriding a
+    # Back category or muscle group.
+    for value in [raw_group, category]:
+        label = direct_label(value)
+        if label in specific_labels:
+            return label
+
+    for value in [raw_group, category, description]:
+        db_match = keyword_match(value)
+        if db_match:
+            return db_match
+
+    name_match = keyword_match(exercise_name)
+    if name_match:
+        return name_match
+
+    for value in [raw_group, category]:
+        label = direct_label(value)
+        if label:
+            return label
+
+    normalized_raw = normalize_label(raw_group)
+    return normalized_raw or normalize_label(category) or "general"
+
+def infer_body_area(normalized_muscle_group, raw_group=""):
+    raw = normalize_label(raw_group)
+    if normalized_muscle_group in {"chest", "back", "shoulders", "biceps", "triceps", "arms"}:
+        return "upper_body"
+    if normalized_muscle_group == "legs":
+        return "lower_body"
+    if normalized_muscle_group in {"core", "cardio"}:
+        return normalized_muscle_group
+    if normalized_muscle_group in {"upper_body", "lower_body", "full_body"}:
+        return normalized_muscle_group
+    if raw in {"upper_body", "lower_body", "full_body"}:
+        return raw
+    return "general"
+
+def infer_exercise_goal_tags(name, normalized_muscle_group, body_area, difficulty):
+    tags = ["strength", "muscle_gain"]
+    difficulty = normalize_label(difficulty)
+    if difficulty:
+        tags.append(difficulty)
+    if body_area == "upper_body":
+        tags.append("upper_body_training")
+    if body_area == "lower_body":
+        tags.append("lower_body_training")
+    if normalized_muscle_group in {"chest", "shoulders", "triceps"}:
+        tags.append("push_day")
+    if normalized_muscle_group in {"back", "biceps"}:
+        tags.append("pull_day")
+    if normalized_muscle_group == "legs":
+        tags.extend(["leg_day", "lower_body"])
+    if normalized_muscle_group == "core":
+        tags.append("core_training")
+    if normalized_muscle_group == "cardio":
+        tags.extend(["fat_loss", "conditioning"])
+
+    name_l = safe_str(name).lower()
+    if any(word in name_l for word in ["push up", "plank", "burpee", "mountain climber", "jumping jack"]):
+        tags.append("bodyweight")
+    if any(word in name_l for word in ["machine", "cable", "smith"]):
+        tags.append("machine_or_cable")
+    return tags
+
+def infer_exercise_search_phrases(name, normalized_muscle_group, body_area, difficulty, goal_tags):
+    phrases = []
+    difficulty = normalize_label(difficulty)
+    if normalized_muscle_group and normalized_muscle_group != "general":
+        phrases.append(f"{difficulty or 'beginner'} {normalized_muscle_group} workout")
+        phrases.append(f"{normalized_muscle_group} exercise")
+    if "push_day" in goal_tags:
+        phrases.extend(["push day exercise", "upper body training"])
+    if "pull_day" in goal_tags:
+        phrases.extend(["pull day exercise", "upper body training"])
+    if "leg_day" in goal_tags:
+        phrases.extend(["leg day exercise", "lower body training"])
+    if body_area == "core":
+        phrases.append("core stability training")
+    if "bodyweight" in goal_tags:
+        phrases.append("bodyweight workout")
+    return phrases
+
+def infer_exercise_caution_hints(name, normalized_muscle_group):
+    text = safe_str(name).lower()
+    hints = []
+    if normalized_muscle_group in {"chest", "shoulders"} or any(word in text for word in ["press", "fly", "push up"]):
+        hints.append("use caution with shoulder discomfort")
+    if normalized_muscle_group in {"biceps", "triceps"} or any(word in text for word in ["curl", "pushdown", "kickback"]):
+        hints.append("use caution with elbow or wrist discomfort")
+    if normalized_muscle_group == "legs" or any(word in text for word in ["squat", "lunge", "leg press", "step up"]):
+        hints.append("use caution with knee discomfort")
+    if any(word in text for word in ["deadlift", "bent over", "row"]):
+        hints.append("use caution with lower-back discomfort")
+    if hints:
+        hints.append("not medical advice")
+    return hints
+
+def infer_food_goal_tags(calories, protein, carbs, fat, category):
+    tags = []
+    calories = safe_float(calories)
+    protein = safe_float(protein)
+    carbs = safe_float(carbs)
+    fat = safe_float(fat)
+    category = normalize_food_category(category)
+
+    if calories > 0:
+        tags.append("balanced")
+        protein_calorie_ratio = (protein * 4) / calories if calories else 0
+        if calories <= 120:
+            tags.append("low_calorie")
+        if calories <= 220 and fat <= 10:
+            tags.append("fat_loss")
+        if protein >= 12 or protein_calorie_ratio >= 0.25:
+            tags.append("high_protein")
+        if protein >= 8 and calories >= 100:
+            tags.append("muscle_gain")
+        if fat <= 3:
+            tags.append("low_fat")
+    if category == "healthy_fat" or fat >= 12:
+        tags.append("healthy_fat")
+    if category == "vegetable":
+        tags.extend(["low_calorie", "fiber"])
+    if category == "fruit":
+        tags.extend(["snack", "carbohydrate"])
+    if category in {"protein", "seafood"}:
+        tags.append("lean_protein" if fat <= 10 else "protein")
+    if carbs >= 20:
+        tags.append("carbohydrate")
+    return tags
+
+def infer_meal_role_tags(food_name, category, calories, protein, carbs, fat):
+    name = safe_str(food_name).lower()
+    category = normalize_food_category(category)
+    calories = safe_float(calories)
+    protein = safe_float(protein)
+    fat = safe_float(fat)
+    tags = []
+
+    if any(word in name for word in ["oat", "egg", "yogurt", "banana", "bread", "toast"]):
+        tags.append("breakfast")
+    if category in {"protein", "seafood", "vegetable", "carbohydrate"} or any(
+        word in name for word in ["chicken", "beef", "turkey", "rice", "potato", "fish", "salmon", "tuna"]
+    ):
+        tags.extend(["lunch", "dinner"])
+    if category in {"fruit", "healthy_fat"} or calories <= 120 or any(
+        word in name for word in ["almond", "walnut", "peanut", "yogurt", "banana"]
+    ):
+        tags.append("snack")
+    if protein >= 20:
+        tags.extend(["lunch", "dinner"])
+    if fat >= 20:
+        tags.append("snack")
+    return tags or ["meal_item"]
+
+def mostly_repeated_or_random_text(value):
+    text = safe_str(value).lower()
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return True
+    if re.search(r"(.)\1{4,}", compact):
+        return True
+    if any(token in compact for token in ["asdf", "qwer", "testtest", "aaaaaaaa", "111111"]):
+        return True
+
+    letters = re.sub(r"[^a-z\u0600-\u06ff]", "", compact)
+    if len(letters) >= 8:
+        unique_ratio = len(set(letters)) / len(letters)
+        vowels = sum(ch in "aeiou" for ch in letters)
+        if unique_ratio < 0.25:
+            return True
+        if re.fullmatch(r"[a-z]+", letters) and vowels == 0 and len(set(letters)) <= 5:
+            return True
+    return False
+
+def is_junk_item(name, *details):
+    name_clean = safe_str(name)
+    normalized_name = normalize_label(name_clean)
+    if normalized_name in {"", "test", "testing", "dummy", "sample", "none", "null"}:
+        return True
+    if len(name_clean) < 2:
+        return True
+    if mostly_repeated_or_random_text(name_clean) and len(name_clean) >= 5:
+        return True
+
+    useful_details = [safe_str(detail) for detail in details if safe_str(detail)]
+    if useful_details:
+        noisy_details = [
+            detail for detail in useful_details
+            if len(detail) >= 8 and mostly_repeated_or_random_text(detail)
+        ]
+        if noisy_details and len(noisy_details) == len(useful_details):
+            return True
+    return False
+
+def exercise_search_quality(row):
+    if is_junk_item(row.get("name"), row.get("instructions"), row.get("common_mistakes")):
+        return "junk"
+    instruction = safe_str(row.get("instructions"))
+    if len(instruction) < 12:
+        return "partial"
+    return "good"
+
+def food_search_quality(row):
+    if is_junk_item(row.get("name"), row.get("nutrition_description")):
+        return "junk"
+    calories = safe_float(row.get("calories"))
+    if calories <= 0:
+        return "partial"
+    return "good"
+
+def build_exercise_item_document(row):
+    raw_name = safe_str(row.get("name"), "Unnamed exercise")
+    raw_group = safe_str(row.get("muscle_group"), "General")
+    category = safe_str(row.get("exercise_category"))
+    description = safe_str(row.get("exercise_description"), "No description")
+    difficulty = safe_str(row.get("difficulty_level"), "beginner")
+    normalized_muscle = infer_normalized_muscle_group(raw_group, raw_name, category, description)
+    body_area = infer_body_area(normalized_muscle, raw_group)
+    goal_tags = infer_exercise_goal_tags(raw_name, normalized_muscle, body_area, difficulty)
+    search_phrases = infer_exercise_search_phrases(raw_name, normalized_muscle, body_area, difficulty, goal_tags)
+    caution_hints = infer_exercise_caution_hints(raw_name, normalized_muscle)
+
+    return "\n".join([
+        "Item strategy: one exercise database record is indexed as one Chroma document.",
+        "Chunking: item-level structured record; no arbitrary character chunking.",
+        "Type: strength exercise",
+        f"Exercise name: {raw_name}",
+        f"Primary muscle group: {normalized_muscle}",
+        f"Raw muscle group: {raw_group}",
+        f"Body area: {body_area}",
+        f"Difficulty: {difficulty}",
+        f"Instructions: {safe_str(row.get('instructions'), 'Not specified')}",
+        f"Common mistakes: {safe_str(row.get('common_mistakes'), 'Not specified')}",
+        f"Category: {category or raw_group}",
+        f"Category description: {description}",
+        f"Goal tags: {csv_tags(goal_tags)}",
+        f"Search phrases: {', '.join(search_phrases) if search_phrases else raw_name}",
+        f"Injury caution hints: {', '.join(caution_hints) if caution_hints else 'none inferred'}",
+    ])
+
+def build_food_item_document(row):
+    raw_name = safe_str(row.get("name"), "Unnamed food")
+    category = normalize_food_category(row.get("category_name"))
+    calories = safe_float(row.get("calories"))
+    protein = safe_float(row.get("protein"))
+    carbs = safe_float(row.get("carbs"))
+    fat = safe_float(row.get("fat"))
+    goal_tags = infer_food_goal_tags(calories, protein, carbs, fat, category)
+    meal_roles = infer_meal_role_tags(raw_name, category, calories, protein, carbs, fat)
+
+    return "\n".join([
+        "Item strategy: one food database record is indexed as one Chroma document.",
+        "Chunking: item-level structured record; no arbitrary character chunking.",
+        "Type: food",
+        f"Food name: {raw_name}",
+        f"Normalized category: {category}",
+        f"Raw category: {safe_str(row.get('category_name'), 'unknown')}",
+        f"Serving size: {safe_str(row.get('serving_size'), 'Not specified')}",
+        f"Calories: {calories:g}",
+        f"Protein: {protein:g}g",
+        f"Carbs: {carbs:g}g",
+        f"Fat: {fat:g}g",
+        f"Description: {safe_str(row.get('nutrition_description'), 'No description')}",
+        f"Goal tags: {csv_tags(goal_tags)}",
+        f"Meal role tags: {csv_tags(meal_roles)}",
+    ])
+
 def exercise_row_to_text(row):
-    return f"{row['name']} | {row['muscle_group']} | {row['difficulty_level']}"
+    return build_exercise_item_document(row)
 
 def nutrition_row_to_text(row):
-    return f"{row['name']} | {row['category_name']} | {row['calories']} cal"
+    return build_food_item_document(row)
 
 def vector_id(data_type: str, row_id):
     if data_type in {"exercise", "exercises"}:
@@ -290,7 +695,7 @@ def embed(text):
 # =====================
 # 📦 PROCESS BATCH (عام)
 # =====================
-def process_batch(rows, collection, manifest_file, row_to_text_func, get_metadata_func, batch_num, total_batches, data_type):
+def process_batch(rows, collection, manifest_file, row_to_text_func, get_metadata_func, batch_num, total_batches, data_type, force_upsert=False):
     print(f"  📦 Processing {data_type} batch {batch_num}/{total_batches} ({len(rows)} items)...")
     
     old_manifest = load_manifest(manifest_file)
@@ -298,7 +703,7 @@ def process_batch(rows, collection, manifest_file, row_to_text_func, get_metadat
     added, updated = 0, 0
     
     for row in rows:
-        embedding_text = row['embedding_text']
+        embedding_text = row_to_text_func(row)
         metadata = get_metadata_func(row)
         row_hash = row_fingerprint(embedding_text, metadata)
         row_id = vector_id(data_type, row["id"])
@@ -315,7 +720,7 @@ def process_batch(rows, collection, manifest_file, row_to_text_func, get_metadat
                 metadatas=[metadata]
             )
             added += 1
-        elif old_hash != row_hash:
+        elif force_upsert or old_hash != row_hash:
             vector = embed(embedding_text)
             collection.upsert(
                 ids=[row_id],
@@ -333,24 +738,51 @@ def process_batch(rows, collection, manifest_file, row_to_text_func, get_metadat
 # 📦 METADATA FUNCTIONS
 # =====================
 def get_exercise_metadata(row):
+    raw_group = safe_str(row.get("muscle_group"), "General")
+    category = safe_str(row.get("exercise_category"))
+    description = safe_str(row.get("exercise_description"))
+    normalized_muscle = infer_normalized_muscle_group(raw_group, row.get("name"), category, description)
+    body_area = infer_body_area(normalized_muscle, raw_group)
+    difficulty = safe_str(row.get("difficulty_level"), "beginner")
+    goal_tags = infer_exercise_goal_tags(row.get("name"), normalized_muscle, body_area, difficulty)
+    search_quality = exercise_search_quality(row)
+
     return {
         "id": row["id"],
-        "name": row["name"],
-        "muscle_group": row["muscle_group"],
-        "difficulty": row["difficulty_level"],
-        "type": "exercise"
+        "type": "exercise",
+        "name": safe_str(row.get("name"), "Unnamed exercise"),
+        "muscle_group": raw_group,
+        "normalized_muscle_group": normalized_muscle,
+        "body_area": body_area,
+        "difficulty": difficulty,
+        "goal_tags": csv_tags(goal_tags),
+        "search_quality": search_quality,
     }
 
 def get_nutrition_metadata(row):
+    category = safe_str(row.get("category_name"), "unknown")
+    normalized_category = normalize_food_category(category)
+    calories = safe_float(row.get("calories"))
+    protein = safe_float(row.get("protein"))
+    carbs = safe_float(row.get("carbs"))
+    fat = safe_float(row.get("fat"))
+    goal_tags = infer_food_goal_tags(calories, protein, carbs, fat, normalized_category)
+    meal_role_tags = infer_meal_role_tags(row.get("name"), normalized_category, calories, protein, carbs, fat)
+    search_quality = food_search_quality(row)
+
     return {
         "id": row["id"],
-        "name": row["name"],
-        "category": row["category_name"],
-        "calories": float(row["calories"]) if row.get("calories") else 0,
-        "protein": float(row["protein"]) if row.get("protein") else 0,
-        "carbs": float(row["carbs"]) if row.get("carbs") else 0,
-        "fat": float(row["fat"]) if row.get("fat") else 0,
-        "type": "food"
+        "type": "food",
+        "name": safe_str(row.get("name"), "Unnamed food"),
+        "category": category,
+        "normalized_category": normalized_category,
+        "calories": calories,
+        "protein": protein,
+        "carbs": carbs,
+        "fat": fat,
+        "goal_tags": csv_tags(goal_tags),
+        "meal_role_tags": csv_tags(meal_role_tags),
+        "search_quality": search_quality,
     }
 
 # =====================
@@ -380,7 +812,8 @@ def sync_exercises_to_vector(full_sync=False):
                 added, updated = process_batch(
                     rows, exercises_collection, EXERCISES_MANIFEST,
                     exercise_row_to_text, get_exercise_metadata,
-                    batch_num + 1, total_batches, "exercises"
+                    batch_num + 1, total_batches, "exercises",
+                    force_upsert=full_sync
                 )
                 total_added += added
                 total_updated += updated
@@ -430,7 +863,8 @@ def sync_nutrition_to_vector(full_sync=False):
                 added, updated = process_batch(
                     rows, nutrition_collection, NUTRITION_MANIFEST,
                     nutrition_row_to_text, get_nutrition_metadata,
-                    batch_num + 1, total_batches, "nutrition"
+                    batch_num + 1, total_batches, "nutrition",
+                    force_upsert=full_sync
                 )
                 total_added += added
                 total_updated += updated
@@ -519,7 +953,162 @@ def sync_all(full_sync=False):
 # =====================
 # 🔍 SEARCH FUNCTIONS
 # =====================
-def search_exercises(query, n_results=10):
+def collection_query_count(collection, requested):
+    try:
+        count = collection.count()
+        if count > 0:
+            return min(requested, count)
+    except Exception:
+        pass
+    return requested
+
+def unpack_chroma_results(results):
+    docs = results.get("documents", [[]])
+    metas = results.get("metadatas", [[]])
+    ids = results.get("ids", [[]])
+    distances = results.get("distances", [[]])
+
+    docs_row = docs[0] if docs else []
+    metas_row = metas[0] if metas else []
+    ids_row = ids[0] if ids else []
+    distances_row = distances[0] if distances else []
+
+    items = []
+    for idx, (doc, meta) in enumerate(zip(docs_row, metas_row)):
+        items.append({
+            "document": doc,
+            "metadata": meta or {},
+            "id": ids_row[idx] if idx < len(ids_row) else None,
+            "distance": distances_row[idx] if idx < len(distances_row) else None,
+        })
+    return items
+
+def pack_chroma_results(items):
+    return {
+        "ids": [[item.get("id") for item in items]],
+        "documents": [[item.get("document") for item in items]],
+        "metadatas": [[item.get("metadata") or {} for item in items]],
+        "distances": [[item.get("distance") for item in items]],
+    }
+
+def tag_string_contains(tags, wanted):
+    wanted = normalize_label(wanted)
+    if not wanted:
+        return True
+    tag_set = {
+        normalize_label(tag)
+        for tag in safe_str(tags).split(",")
+        if normalize_label(tag)
+    }
+    return wanted in tag_set
+
+def item_search_quality(meta):
+    return safe_str(meta.get("search_quality"), "good").lower() or "good"
+
+def exercise_item_matches_filters(item, filters):
+    filters = filters or {}
+    meta = item.get("metadata") or {}
+
+    if filters.get("exclude_junk", True) and item_search_quality(meta) == "junk":
+        return False
+
+    difficulty = filters.get("difficulty")
+    if difficulty and normalize_label(meta.get("difficulty")) != normalize_label(difficulty):
+        return False
+
+    muscle_group = filters.get("muscle_group")
+    if muscle_group:
+        wanted = normalize_label(muscle_group)
+        candidates = {
+            normalize_label(meta.get("muscle_group")),
+            normalize_label(meta.get("normalized_muscle_group")),
+            normalize_label(meta.get("body_area")),
+        }
+        if wanted not in candidates:
+            return False
+
+    goal = filters.get("goal")
+    if goal and not tag_string_contains(meta.get("goal_tags"), goal):
+        return False
+
+    return True
+
+def food_item_matches_filters(item, filters):
+    filters = filters or {}
+    meta = item.get("metadata") or {}
+
+    if filters.get("exclude_junk", True) and item_search_quality(meta) == "junk":
+        return False
+
+    category = filters.get("category")
+    if category:
+        wanted = normalize_food_category(category)
+        candidates = {
+            normalize_food_category(meta.get("category")),
+            normalize_food_category(meta.get("normalized_category")),
+        }
+        if wanted not in candidates:
+            return False
+
+    min_protein = filters.get("min_protein")
+    if min_protein is not None and safe_float(meta.get("protein")) < safe_float(min_protein):
+        return False
+
+    max_calories = filters.get("max_calories")
+    if max_calories is not None and safe_float(meta.get("calories")) > safe_float(max_calories):
+        return False
+
+    goal = filters.get("goal")
+    if goal and not tag_string_contains(meta.get("goal_tags"), goal):
+        return False
+
+    return True
+
+def filtered_collection_query(collection, query, n_results, filters, match_func):
+    query_vector = embed(query)
+    fetch_count = n_results
+    if filters:
+        fetch_count = max(n_results * 4, n_results + 10)
+    fetch_count = collection_query_count(collection, fetch_count)
+
+    if fetch_count <= 0:
+        return pack_chroma_results([])
+
+    results = collection.query(
+        query_embeddings=[query_vector],
+        n_results=fetch_count
+    )
+
+    items = unpack_chroma_results(results)
+    filtered_items = [
+        item for item in items
+        if match_func(item, filters)
+    ][:n_results]
+    return pack_chroma_results(filtered_items)
+
+def search_exercises(query, n_results=10, filters=None):
+    filters = dict(filters or {})
+    filters.setdefault("exclude_junk", True)
+    return filtered_collection_query(
+        exercises_collection,
+        query,
+        n_results,
+        filters,
+        exercise_item_matches_filters,
+    )
+
+def search_nutrition(query, n_results=10, filters=None):
+    filters = dict(filters or {})
+    filters.setdefault("exclude_junk", True)
+    return filtered_collection_query(
+        nutrition_collection,
+        query,
+        n_results,
+        filters,
+        food_item_matches_filters,
+    )
+
+def legacy_search_exercises(query, n_results=10):
     query_vector = embed(query)
     results = exercises_collection.query(
         query_embeddings=[query_vector],
@@ -527,7 +1116,7 @@ def search_exercises(query, n_results=10):
     )
     return results
 
-def search_nutrition(query, n_results=10):
+def legacy_search_nutrition(query, n_results=10):
     query_vector = embed(query)
     results = nutrition_collection.query(
         query_embeddings=[query_vector],
@@ -570,6 +1159,14 @@ class AnalyzeProgressRequest(BaseModel):
 class SearchRequest(BaseModel):
     query: Optional[str] = None
     n_results: Optional[int] = 10
+    difficulty: Optional[str] = None
+    muscle_group: Optional[str] = None
+    category: Optional[str] = None
+    min_protein: Optional[float] = None
+    max_calories: Optional[float] = None
+    goal: Optional[str] = None
+    exclude_junk: Optional[bool] = True
+    debug_context: Optional[bool] = False
 
 class SmartModifyTrainingRequest(BaseModel):
     current_plan_id: str
@@ -822,8 +1419,6 @@ def collect_suggested_exercises(
                 continue
             if not exercise_matches_focus(ex_name, focus):
                 continue
-            print("DEBUG_MIXED_FOCUS", focus, ex_name, exercise_matches_focus(ex_name, focus))
-
             suggested.append({
                 "id": ex_id,
                 "name": ex_name,
@@ -1073,36 +1668,114 @@ def resolve_search_params(query: Optional[str], n_results: Optional[int], body: 
 
     return str(resolved_query).strip(), resolved_n_results
 
-def format_search_response(query: str, result_type: str, results: Dict[str, Any]):
-    docs = results.get("documents", [[]])
-    metas = results.get("metadatas", [[]])
-    ids = results.get("ids", [[]])
-    distances = results.get("distances", [[]])
+def first_present(*values):
+    for value in values:
+        if value is not None:
+            return value
+    return None
 
-    docs_row = docs[0] if docs else []
-    metas_row = metas[0] if metas else []
-    ids_row = ids[0] if ids else []
-    distances_row = distances[0] if distances else []
+def resolve_debug_context(debug_context: Optional[bool], body: Optional[SearchRequest]):
+    return bool(first_present(debug_context, body.debug_context if body else None, False))
 
+def build_exercise_filters(body, difficulty=None, muscle_group=None, goal=None, exclude_junk=None):
+    return {
+        "difficulty": first_present(difficulty, body.difficulty if body else None),
+        "muscle_group": first_present(muscle_group, body.muscle_group if body else None),
+        "goal": first_present(goal, body.goal if body else None),
+        "exclude_junk": bool(first_present(exclude_junk, body.exclude_junk if body else None, True)),
+    }
+
+def build_food_filters(body, category=None, min_protein=None, max_calories=None, goal=None, exclude_junk=None):
+    return {
+        "category": first_present(category, body.category if body else None),
+        "min_protein": first_present(min_protein, body.min_protein if body else None),
+        "max_calories": first_present(max_calories, body.max_calories if body else None),
+        "goal": first_present(goal, body.goal if body else None),
+        "exclude_junk": bool(first_present(exclude_junk, body.exclude_junk if body else None, True)),
+    }
+
+def distance_to_score(distance):
+    distance = safe_float(distance, None)
+    if distance is None:
+        return None
+    if distance < 0:
+        distance = 0
+    return round(1 / (1 + distance), 4)
+
+def preview_text(document, max_len=220):
+    text = re.sub(r"\s+", " ", safe_str(document)).strip()
+    if len(text) <= max_len:
+        return text
+    return text[:max_len].rstrip() + "..."
+
+def build_exercise_context(results):
+    blocks = []
+    for item in unpack_chroma_results(results):
+        meta = item.get("metadata") or {}
+        blocks.append("\n".join([
+            f"Exercise ID: {meta.get('id', item.get('id'))}",
+            f"Name: {safe_str(meta.get('name'), 'Exercise')}",
+            f"Muscle: {safe_str(meta.get('normalized_muscle_group'), safe_str(meta.get('muscle_group'), 'general'))}",
+            f"Body area: {safe_str(meta.get('body_area'), 'general')}",
+            f"Difficulty: {safe_str(meta.get('difficulty'), 'unknown')}",
+            f"Goal tags: {safe_str(meta.get('goal_tags'), '')}",
+            f"Search quality: {item_search_quality(meta)}",
+            f"Context: {preview_text(item.get('document'), 500)}",
+        ]))
+    return "\n\n".join(blocks)
+
+def build_food_context(results):
+    blocks = []
+    for item in unpack_chroma_results(results):
+        meta = item.get("metadata") or {}
+        blocks.append("\n".join([
+            f"Food ID: {meta.get('id', item.get('id'))}",
+            f"Name: {safe_str(meta.get('name'), 'Food')}",
+            f"Category: {safe_str(meta.get('normalized_category'), safe_str(meta.get('category'), 'unknown'))}",
+            f"Macros: {safe_float(meta.get('calories')):g} cal, {safe_float(meta.get('protein')):g}g protein, {safe_float(meta.get('carbs')):g}g carbs, {safe_float(meta.get('fat')):g}g fat",
+            f"Goal tags: {safe_str(meta.get('goal_tags'), '')}",
+            f"Meal roles: {safe_str(meta.get('meal_role_tags'), '')}",
+            f"Search quality: {item_search_quality(meta)}",
+            f"Context: {preview_text(item.get('document'), 500)}",
+        ]))
+    return "\n\n".join(blocks)
+
+def format_search_response(query: str, result_type: str, results: Dict[str, Any], debug_context: bool = False):
     formatted = []
-    for idx, (doc, meta) in enumerate(zip(docs_row, metas_row)):
+    source_table = "exercises" if result_type == "exercises" else "foods"
+
+    for raw_item in unpack_chroma_results(results):
+        doc = raw_item.get("document")
+        meta = raw_item.get("metadata") or {}
+        distance = raw_item.get("distance")
         item = {
             "document": doc,
             "metadata": meta,
+            "id": raw_item.get("id"),
+            "distance": distance,
+            "source_id": meta.get("id"),
+            "source_table": source_table,
+            "source_name": meta.get("name"),
+            "score": distance_to_score(distance),
+            "preview": preview_text(doc),
+            "search_quality": item_search_quality(meta),
         }
-        if idx < len(ids_row):
-            item["id"] = ids_row[idx]
-        if idx < len(distances_row):
-            item["distance"] = distances_row[idx]
         formatted.append(item)
 
-    return {
+    response = {
         "status": "success",
         "query": query,
         "type": result_type,
         "count": len(formatted),
         "results": formatted,
     }
+    if debug_context:
+        response["context_preview"] = (
+            build_exercise_context(results)
+            if result_type == "exercises"
+            else build_food_context(results)
+        )
+    return response
 
 @app.post("/sync-all")
 async def sync_all_data(full_sync: bool = Query(False)):
@@ -1122,11 +1795,28 @@ async def search_exercises_api(
     body: Optional[SearchRequest] = None,
     query: Optional[str] = Query(None),
     n_results: Optional[int] = Query(None),
+    difficulty: Optional[str] = Query(None),
+    muscle_group: Optional[str] = Query(None),
+    goal: Optional[str] = Query(None),
+    exclude_junk: Optional[bool] = Query(None),
+    debug_context: Optional[bool] = Query(None),
 ):
     try:
         resolved_query, resolved_n_results = resolve_search_params(query, n_results, body)
-        results = search_exercises(resolved_query, resolved_n_results)
-        return format_search_response(resolved_query, "exercises", results)
+        filters = build_exercise_filters(
+            body,
+            difficulty=difficulty,
+            muscle_group=muscle_group,
+            goal=goal,
+            exclude_junk=exclude_junk,
+        )
+        results = search_exercises(resolved_query, resolved_n_results, filters=filters)
+        return format_search_response(
+            resolved_query,
+            "exercises",
+            results,
+            debug_context=resolve_debug_context(debug_context, body),
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -1138,11 +1828,30 @@ async def search_foods_api(
     body: Optional[SearchRequest] = None,
     query: Optional[str] = Query(None),
     n_results: Optional[int] = Query(None),
+    category: Optional[str] = Query(None),
+    min_protein: Optional[float] = Query(None),
+    max_calories: Optional[float] = Query(None),
+    goal: Optional[str] = Query(None),
+    exclude_junk: Optional[bool] = Query(None),
+    debug_context: Optional[bool] = Query(None),
 ):
     try:
         resolved_query, resolved_n_results = resolve_search_params(query, n_results, body)
-        results = search_nutrition(resolved_query, resolved_n_results)
-        return format_search_response(resolved_query, "foods", results)
+        filters = build_food_filters(
+            body,
+            category=category,
+            min_protein=min_protein,
+            max_calories=max_calories,
+            goal=goal,
+            exclude_junk=exclude_junk,
+        )
+        results = search_nutrition(resolved_query, resolved_n_results, filters=filters)
+        return format_search_response(
+            resolved_query,
+            "foods",
+            results,
+            debug_context=resolve_debug_context(debug_context, body),
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -1683,7 +2392,6 @@ def analyze_nutrition_and_suggest_modifications(current_plan, user_feedback, sea
     blocked_terms = expand_blocked_terms(disliked_foods)
 
     goal = normalize_term(user_feedback.get("goal", "")).replace(" ", "_")
-    recommendations.append(f"DEBUG_GOAL={goal}")
     notes = normalize_term(user_feedback.get("notes", ""))
 
     if goal == "higher_protein":
@@ -1907,8 +2615,6 @@ def analyze_nutrition_and_suggest_modifications(current_plan, user_feedback, sea
         recommendations.append("Removed or reduced disliked foods where alternatives were available.")
     if notes:
         recommendations.append("Applied the user's nutrition notes where possible.")
-
-    recommendations.append("FINAL_CLEANUP_OK")
 
     return {
         "plan_id": current_plan.get("plan_id", "unknown"),

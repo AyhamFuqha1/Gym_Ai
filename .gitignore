@@ -1,0 +1,7 @@
+.env
+chroma_gym/
+data/sync_checkpoint.json
+gym_manifest.json
+nutrition_manifest.json
+__pycache__/
+*.pyc
