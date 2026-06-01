@@ -2,7 +2,7 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from datetime import datetime
 import os
 import hashlib
@@ -11,46 +11,45 @@ import chromadb
 import time
 import json
 import traceback
-from dotenv import load_dotenv
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from config import settings
 import re
 import copy
 
-load_dotenv()
-
 # =====================
 # 🧠 EMBEDDINGS
 # =====================
-embeddings = GoogleGenerativeAIEmbeddings(
-    model="models/gemini-embedding-2-preview",
-    google_api_key=os.getenv("GEMINI_API_KEY")
-)
+embeddings = None
+
+def get_embeddings():
+    global embeddings
+    if embeddings is None:
+        if not settings.GEMINI_API_KEY:
+            raise RuntimeError("GEMINI_API_KEY is required for embedding operations")
+        embeddings = GoogleGenerativeAIEmbeddings(
+            model=settings.GEMINI_EMBEDDING_MODEL,
+            google_api_key=settings.GEMINI_API_KEY
+        )
+    return embeddings
 
 # =====================
 # 🗄️ MYSQL CONFIG
 # =====================
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "127.0.0.1"),
-    "port": int(os.getenv("DB_PORT", 3306)),
-    "user": os.getenv("DB_USERNAME", "root"),
-    "password": os.getenv("DB_PASSWORD", ""),
-    "database": os.getenv("DB_DATABASE", "gym"),
-}
+DB_CONFIG = settings.DB_CONFIG
 
 # =====================
 # 🧠 CHROMA DB - Collections
 # =====================
-client = chromadb.PersistentClient(path="chroma_gym")
-exercises_collection = client.get_or_create_collection(name="exercises_data")
-nutrition_collection = client.get_or_create_collection(name="nutrition_data")
+client = chromadb.PersistentClient(path=settings.CHROMA_PATH)
+exercises_collection = client.get_or_create_collection(name=settings.EXERCISES_COLLECTION)
+nutrition_collection = client.get_or_create_collection(name=settings.NUTRITION_COLLECTION)
 
 # =====================
 # 📌 MANIFEST & CHECKPOINT
 # =====================
-EXERCISES_MANIFEST = "gym_manifest.json"
-NUTRITION_MANIFEST = "nutrition_manifest.json"
-CHECKPOINT_FILE = "./data/sync_checkpoint.json"
+EXERCISES_MANIFEST = settings.EXERCISES_MANIFEST
+NUTRITION_MANIFEST = settings.NUTRITION_MANIFEST
+CHECKPOINT_FILE = settings.CHECKPOINT_FILE
 
 # =====================
 # 🔌 DB CONNECTION
@@ -228,11 +227,32 @@ def exercise_row_to_text(row):
 def nutrition_row_to_text(row):
     return f"{row['name']} | {row['category_name']} | {row['calories']} cal"
 
+def vector_id(data_type: str, row_id):
+    if data_type in {"exercise", "exercises"}:
+        return f"exercise:{row_id}"
+    if data_type in {"food", "nutrition"}:
+        return f"food:{row_id}"
+    return str(row_id)
+
 # =====================
 # 🔐 HASH FUNCTION
 # =====================
-def hash_row(text: str):
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def hash_row(payload):
+    if not isinstance(payload, str):
+        payload = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+def row_fingerprint(embedding_text: str, metadata: Dict[str, Any]):
+    return hash_row({
+        "document": embedding_text,
+        "metadata": metadata,
+    })
+
+def manifest_has_legacy_ids(manifest_file: str, prefix: str):
+    manifest = load_manifest(manifest_file)
+    if not manifest:
+        return False
+    return any(not str(row_id).startswith(f"{prefix}:") for row_id in manifest.keys())
 
 # =====================
 # 📂 LOAD/SAVE MANIFEST
@@ -265,7 +285,7 @@ def save_checkpoint(data):
 # 🧠 EMBED
 # =====================
 def embed(text):
-    return embeddings.embed_query(text)
+    return get_embeddings().embed_query(text)
 
 # =====================
 # 📦 PROCESS BATCH (عام)
@@ -279,18 +299,16 @@ def process_batch(rows, collection, manifest_file, row_to_text_func, get_metadat
     
     for row in rows:
         embedding_text = row['embedding_text']
-        hash_text = row_to_text_func(row)
-        row_hash = hash_row(hash_text)
-        row_id = str(row["id"])
-        
-        new_manifest[row_id] = row_hash
-        old_hash = old_manifest.get(row_id)
-        
         metadata = get_metadata_func(row)
+        row_hash = row_fingerprint(embedding_text, metadata)
+        row_id = vector_id(data_type, row["id"])
+
+        old_hash = old_manifest.get(row_id)
+        new_manifest[row_id] = row_hash
         
         if old_hash is None:
             vector = embed(embedding_text)
-            collection.add(
+            collection.upsert(
                 ids=[row_id],
                 documents=[embedding_text],
                 embeddings=[vector],
@@ -299,7 +317,7 @@ def process_batch(rows, collection, manifest_file, row_to_text_func, get_metadat
             added += 1
         elif old_hash != row_hash:
             vector = embed(embedding_text)
-            collection.update(
+            collection.upsert(
                 ids=[row_id],
                 documents=[embedding_text],
                 embeddings=[vector],
@@ -341,6 +359,10 @@ def get_nutrition_metadata(row):
 def sync_exercises_to_vector(full_sync=False):
     print("🔄 Syncing Exercises...")
     total_added, total_updated = 0, 0
+
+    if not full_sync and manifest_has_legacy_ids(EXERCISES_MANIFEST, "exercise"):
+        print("   Legacy exercise vector ids detected; running one-time full sync migration")
+        return sync_exercises_to_vector(full_sync=True)
     
     if full_sync:
         all_ids = fetch_all_exercise_ids()
@@ -387,6 +409,10 @@ def sync_exercises_to_vector(full_sync=False):
 def sync_nutrition_to_vector(full_sync=False):
     print("🔄 Syncing Nutrition...")
     total_added, total_updated = 0, 0
+
+    if not full_sync and manifest_has_legacy_ids(NUTRITION_MANIFEST, "food"):
+        print("   Legacy nutrition vector ids detected; running one-time full sync migration")
+        return sync_nutrition_to_vector(full_sync=True)
     
     if full_sync:
         all_ids = fetch_all_nutrition_ids()
@@ -430,6 +456,22 @@ def sync_nutrition_to_vector(full_sync=False):
     print(f"   ✅ Nutrition sync: +{total_added} added, 🔄{total_updated} updated")
     return total_added, total_updated
 
+def prune_deleted_records(collection, manifest_file, current_ids):
+    manifest = load_manifest(manifest_file)
+    manifest_ids = set(manifest.keys())
+    deleted_ids = manifest_ids - current_ids
+
+    if deleted_ids:
+        collection.delete(ids=sorted(deleted_ids))
+
+    pruned_manifest = {
+        row_id: manifest[row_id]
+        for row_id in sorted(current_ids)
+        if row_id in manifest
+    }
+    save_manifest(manifest_file, pruned_manifest)
+    return len(deleted_ids)
+
 def sync_all(full_sync=False):
     print("🔄 Starting Full Smart Sync...")
     start_time = time.time()
@@ -437,17 +479,25 @@ def sync_all(full_sync=False):
     exercises_added, exercises_updated = sync_exercises_to_vector(full_sync)
     nutrition_added, nutrition_updated = sync_nutrition_to_vector(full_sync)
     
-    current_exercise_ids = set(fetch_all_exercise_ids())
-    old_exercise_manifest = load_manifest(EXERCISES_MANIFEST)
-    deleted_exercises = set(old_exercise_manifest.keys()) - current_exercise_ids
-    for row_id in deleted_exercises:
-        exercises_collection.delete(ids=[row_id])
+    current_exercise_ids = {
+        vector_id("exercise", row_id)
+        for row_id in fetch_all_exercise_ids()
+    }
+    deleted_exercises = prune_deleted_records(
+        exercises_collection,
+        EXERCISES_MANIFEST,
+        current_exercise_ids
+    )
     
-    current_nutrition_ids = set(fetch_all_nutrition_ids())
-    old_nutrition_manifest = load_manifest(NUTRITION_MANIFEST)
-    deleted_nutrition = set(old_nutrition_manifest.keys()) - current_nutrition_ids
-    for row_id in deleted_nutrition:
-        nutrition_collection.delete(ids=[row_id])
+    current_nutrition_ids = {
+        vector_id("food", row_id)
+        for row_id in fetch_all_nutrition_ids()
+    }
+    deleted_nutrition = prune_deleted_records(
+        nutrition_collection,
+        NUTRITION_MANIFEST,
+        current_nutrition_ids
+    )
     
     save_checkpoint({
         "last_sync_time": datetime.now().isoformat(),
@@ -457,12 +507,12 @@ def sync_all(full_sync=False):
     
     elapsed_time = time.time() - start_time
     print(f"\n✅ ALL SYNC DONE in {elapsed_time:.2f} seconds")
-    print(f"   Exercises: +{exercises_added} added, 🔄{exercises_updated} updated, 🗑{len(deleted_exercises)} deleted")
-    print(f"   Nutrition: +{nutrition_added} added, 🔄{nutrition_updated} updated, 🗑{len(deleted_nutrition)} deleted")
+    print(f"   Exercises: +{exercises_added} added, 🔄{exercises_updated} updated, 🗑{deleted_exercises} deleted")
+    print(f"   Nutrition: +{nutrition_added} added, 🔄{nutrition_updated} updated, 🗑{deleted_nutrition} deleted")
     
     return {
-        "exercises": {"added": exercises_added, "updated": exercises_updated, "deleted": len(deleted_exercises)},
-        "nutrition": {"added": nutrition_added, "updated": nutrition_updated, "deleted": len(deleted_nutrition)},
+        "exercises": {"added": exercises_added, "updated": exercises_updated, "deleted": deleted_exercises},
+        "nutrition": {"added": nutrition_added, "updated": nutrition_updated, "deleted": deleted_nutrition},
         "elapsed_seconds": elapsed_time
     }
 
@@ -515,7 +565,11 @@ class GenerateNutritionRequest(BaseModel):
 class AnalyzeProgressRequest(BaseModel):
     user_summary: UserSummary
     progress_data: Dict[str, Any]
-    current_plan_id: Optional[str] = None
+    current_plan_id: Optional[Union[int, str]] = None
+
+class SearchRequest(BaseModel):
+    query: Optional[str] = None
+    n_results: Optional[int] = 10
 
 class SmartModifyTrainingRequest(BaseModel):
     current_plan_id: str
@@ -976,11 +1030,11 @@ def analyze_plan_and_suggest_modifications(current_plan, user_feedback, search_f
 # =====================
 # 🚀 FASTAPI APP
 # =====================
-app = FastAPI(title="Gym AI Service", debug=settings.DEBUG)
+app = FastAPI(title=settings.APP_NAME, debug=settings.DEBUG)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.CORS_ALLOW_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -997,43 +1051,100 @@ async def root():
 async def health():
     return {"status": "healthy"}
 
+def resolve_search_params(query: Optional[str], n_results: Optional[int], body: Optional[SearchRequest]):
+    resolved_query = query or (body.query if body else None)
+    resolved_n_results = n_results
+
+    if resolved_n_results is None and body:
+        resolved_n_results = body.n_results
+    if resolved_n_results is None:
+        resolved_n_results = 10
+
+    if not resolved_query or not str(resolved_query).strip():
+        raise HTTPException(status_code=422, detail="query is required")
+
+    try:
+        resolved_n_results = int(resolved_n_results)
+    except (TypeError, ValueError):
+        resolved_n_results = 10
+
+    if resolved_n_results <= 0:
+        resolved_n_results = 10
+
+    return str(resolved_query).strip(), resolved_n_results
+
+def format_search_response(query: str, result_type: str, results: Dict[str, Any]):
+    docs = results.get("documents", [[]])
+    metas = results.get("metadatas", [[]])
+    ids = results.get("ids", [[]])
+    distances = results.get("distances", [[]])
+
+    docs_row = docs[0] if docs else []
+    metas_row = metas[0] if metas else []
+    ids_row = ids[0] if ids else []
+    distances_row = distances[0] if distances else []
+
+    formatted = []
+    for idx, (doc, meta) in enumerate(zip(docs_row, metas_row)):
+        item = {
+            "document": doc,
+            "metadata": meta,
+        }
+        if idx < len(ids_row):
+            item["id"] = ids_row[idx]
+        if idx < len(distances_row):
+            item["distance"] = distances_row[idx]
+        formatted.append(item)
+
+    return {
+        "status": "success",
+        "query": query,
+        "type": result_type,
+        "count": len(formatted),
+        "results": formatted,
+    }
+
 @app.post("/sync-all")
 async def sync_all_data(full_sync: bool = Query(False)):
     try:
         result = sync_all(full_sync=full_sync)
-        return {"status": "success", "stats": result}
+        return {
+            "status": "success",
+            "message": "Sync completed",
+            "stats": result,
+        }
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/search-exercises")
-async def search_exercises_api(query: str, n_results: int = 10):
+async def search_exercises_api(
+    body: Optional[SearchRequest] = None,
+    query: Optional[str] = Query(None),
+    n_results: Optional[int] = Query(None),
+):
     try:
-        results = search_exercises(query, n_results)
-        return {
-            "query": query,
-            "type": "exercises",
-            "results": [
-                {"document": doc, "metadata": meta}
-                for doc, meta in zip(results["documents"][0], results["metadatas"][0])
-            ]
-        }
+        resolved_query, resolved_n_results = resolve_search_params(query, n_results, body)
+        results = search_exercises(resolved_query, resolved_n_results)
+        return format_search_response(resolved_query, "exercises", results)
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/search-foods")
-async def search_foods_api(query: str, n_results: int = 10):
+async def search_foods_api(
+    body: Optional[SearchRequest] = None,
+    query: Optional[str] = Query(None),
+    n_results: Optional[int] = Query(None),
+):
     try:
-        results = search_nutrition(query, n_results)
-        return {
-            "query": query,
-            "type": "foods",
-            "results": [
-                {"document": doc, "metadata": meta}
-                for doc, meta in zip(results["documents"][0], results["metadatas"][0])
-            ]
-        }
+        resolved_query, resolved_n_results = resolve_search_params(query, n_results, body)
+        results = search_nutrition(resolved_query, resolved_n_results)
+        return format_search_response(resolved_query, "foods", results)
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
@@ -1821,37 +1932,231 @@ async def modify_nutrition_plan(request: SmartModifyNutritionRequest):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+def to_float_or_none(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+def first_number(data: Dict[str, Any], keys: List[str], fallback=None):
+    containers = [data]
+    for parent_key in ["metrics", "summary", "latest", "progress"]:
+        parent = data.get(parent_key)
+        if isinstance(parent, dict):
+            containers.append(parent)
+
+    for container in containers:
+        for key in keys:
+            value = to_float_or_none(container.get(key))
+            if value is not None:
+                return value
+
+    fallback_value = to_float_or_none(fallback)
+    return fallback_value
+
+def average_from_logs(progress_data: Dict[str, Any], log_key: str, value_keys: List[str]):
+    logs = progress_data.get(log_key, [])
+    if not isinstance(logs, list):
+        return None
+
+    values = []
+    for item in logs:
+        if not isinstance(item, dict):
+            continue
+        for key in value_keys:
+            value = to_float_or_none(item.get(key))
+            if value is not None:
+                values.append(value)
+                break
+
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+def sequence_change(progress_data: Dict[str, Any], log_keys: List[str], value_keys: List[str], relative=False):
+    for log_key in log_keys:
+        logs = progress_data.get(log_key, [])
+        if not isinstance(logs, list):
+            continue
+
+        values = []
+        for item in logs:
+            if isinstance(item, dict):
+                for key in value_keys:
+                    value = to_float_or_none(item.get(key))
+                    if value is not None:
+                        values.append(value)
+                        break
+            else:
+                value = to_float_or_none(item)
+                if value is not None:
+                    values.append(value)
+
+        if len(values) >= 2:
+            change = values[-1] - values[0]
+            if relative and values[0] != 0:
+                return change / abs(values[0])
+            return change
+
+    return None
+
+def build_progress_analysis(user_summary: UserSummary, progress_data: Dict[str, Any], current_plan_id=None):
+    progress_data = progress_data or {}
+    goal = normalize_term(user_summary.goal).replace(" ", "_")
+
+    progress_rate = first_number(
+        progress_data,
+        ["progress_rate", "rate", "weekly_progress_rate"],
+        user_summary.progress_rate,
+    )
+    consistency = first_number(
+        progress_data,
+        ["consistency_score", "consistency", "adherence_score"],
+        user_summary.consistency_score,
+    )
+
+    completed_workouts = first_number(progress_data, ["completed_workouts", "workouts_completed"])
+    planned_workouts = first_number(progress_data, ["planned_workouts", "scheduled_workouts"])
+    workout_completion_rate = first_number(
+        progress_data,
+        ["workout_completion_rate", "training_adherence", "workout_adherence"],
+    )
+    if workout_completion_rate is None and planned_workouts and completed_workouts is not None:
+        workout_completion_rate = completed_workouts / planned_workouts
+
+    nutrition_adherence = first_number(
+        progress_data,
+        ["nutrition_adherence", "meal_adherence", "diet_adherence"],
+    )
+    if nutrition_adherence is None:
+        nutrition_adherence = average_from_logs(
+            progress_data,
+            "nutrition_logs",
+            ["adherence_score", "meal_adherence", "diet_adherence"],
+        )
+
+    weight_change = first_number(
+        progress_data,
+        ["weight_change", "weight_delta", "body_weight_change"],
+    )
+    if weight_change is None:
+        weight_change = sequence_change(
+            progress_data,
+            ["weight_logs", "body_weight_logs", "weights"],
+            ["weight", "body_weight", "value"],
+        )
+
+    strength_change = first_number(
+        progress_data,
+        ["strength_change", "strength_progress", "volume_change", "training_volume_change"],
+    )
+    if strength_change is None:
+        strength_change = sequence_change(
+            progress_data,
+            ["workout_logs", "strength_logs", "exercise_logs"],
+            ["total_volume", "volume", "estimated_1rm", "one_rep_max", "max_weight"],
+            relative=True,
+        )
+
+    evidence = []
+    metrics = {
+        "progress_rate": progress_rate,
+        "consistency_score": consistency,
+        "workout_completion_rate": workout_completion_rate,
+        "nutrition_adherence": nutrition_adherence,
+        "weight_change": weight_change,
+        "strength_change": strength_change,
+    }
+
+    for metric, value in metrics.items():
+        if value is not None:
+            evidence.append({"metric": metric, "value": round(value, 4)})
+
+    reasons = []
+    suggested_training_changes = []
+    suggested_nutrition_changes = []
+
+    if progress_rate is not None and progress_rate < 0.05:
+        reasons.append("progress rate is low")
+        suggested_training_changes.append("Review weekly volume, exercise selection, and progressive overload.")
+
+    if consistency is not None and consistency < 0.6:
+        reasons.append("overall consistency is low")
+        suggested_training_changes.append("Reduce plan complexity or training frequency until adherence improves.")
+
+    if workout_completion_rate is not None and workout_completion_rate < 0.6:
+        reasons.append("workout completion rate is low")
+        suggested_training_changes.append("Shorten sessions or reduce weekly training days to improve completion.")
+
+    if strength_change is not None and strength_change < -0.05:
+        reasons.append("strength or training volume is trending down")
+        suggested_training_changes.append("Add a recovery-focused deload and avoid increasing load this week.")
+
+    if nutrition_adherence is not None and nutrition_adherence < 0.6:
+        reasons.append("nutrition adherence is low")
+        suggested_nutrition_changes.append("Simplify meals and use easier high-protein staples.")
+
+    if weight_change is not None:
+        if goal in ["fat_loss", "weight_loss", "lower_calories"] and weight_change >= 0.2:
+            reasons.append("weight is not moving toward the fat-loss goal")
+            suggested_nutrition_changes.append("Recheck daily calories and increase lean protein/vegetable choices.")
+        elif goal in ["muscle_gain", "higher_protein"] and weight_change <= -0.2:
+            reasons.append("weight is dropping during a muscle-gain goal")
+            suggested_nutrition_changes.append("Increase daily calories with controlled protein and carbohydrate portions.")
+
+    if user_summary.injuries:
+        suggested_training_changes.append("Keep exercise substitutions joint-friendly for active injuries.")
+
+    needs_modification = bool(reasons)
+
+    if not suggested_training_changes:
+        suggested_training_changes.append("Keep the current training plan and monitor the next check-in.")
+    if not suggested_nutrition_changes:
+        suggested_nutrition_changes.append("Keep the current nutrition plan unless adherence drops.")
+
+    if needs_modification:
+        if any("adherence" in reason or "completion" in reason or "consistency" in reason for reason in reasons):
+            status = "low_adherence"
+        else:
+            status = "plateau"
+        summary = "Progress data suggests the plan may need adjustment."
+        reason = "; ".join(reasons)
+    elif progress_rate is not None and progress_rate > 0.15 and (consistency is None or consistency >= 0.75):
+        status = "progressing_well"
+        summary = "Progress data looks strong; no major change is needed."
+        reason = "progress and consistency are acceptable"
+    else:
+        status = "steady_progress"
+        summary = "Progress is acceptable; continue monitoring before making major changes."
+        reason = "no strong negative trend detected"
+
+    return {
+        "user_id": user_summary.user_id,
+        "current_plan_id": current_plan_id,
+        "analysis_date": datetime.now().isoformat(),
+        "status": status,
+        "summary": summary,
+        "needs_modification": needs_modification,
+        "reason": reason,
+        "evidence": evidence,
+        "suggested_training_changes": suggested_training_changes[:6],
+        "suggested_nutrition_changes": suggested_nutrition_changes[:6],
+        # Backward-compatible fields for older callers.
+        "metrics": metrics,
+        "recommendations": (suggested_training_changes + suggested_nutrition_changes)[:6],
+        "suggested_action": "modify_plan" if needs_modification else "continue",
+    }
+
 @app.post("/analyze-progress")
 async def analyze_progress(request: AnalyzeProgressRequest):
     try:
-        progress_rate = request.user_summary.progress_rate
-        consistency = request.user_summary.consistency_score
-        
-        if progress_rate < 0.05:
-            status = "plateau"
-            recommendation = "Increase volume or change exercises"
-            action = "modify_plan"
-        elif progress_rate > 0.15:
-            status = "progressing_well"
-            recommendation = "Continue current plan"
-            action = "continue"
-        else:
-            status = "steady_progress"
-            recommendation = "Minor adjustments recommended"
-            action = "moderate"
-        
-        return {
-            "user_id": request.user_summary.user_id,
-            "analysis_date": datetime.now().isoformat(),
-            "status": status,
-            "metrics": {
-                "progress_rate": progress_rate,
-                "consistency_score": consistency,
-                "estimated_next_plateau_days": 14 if progress_rate > 0.1 else 7
-            },
-            "recommendations": [recommendation],
-            "suggested_action": action
-        }
+        return build_progress_analysis(
+            user_summary=request.user_summary,
+            progress_data=request.progress_data,
+            current_plan_id=request.current_plan_id,
+        )
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
