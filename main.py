@@ -1,7 +1,7 @@
 # main.py
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from typing import Optional, List, Dict, Any, Union
 from datetime import datetime
 import os
@@ -11,10 +11,17 @@ import chromadb
 import time
 import json
 import traceback
+import logging
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from config import settings
+from llm_client import call_openrouter_chat
+from prompt_builders import build_training_plan_prompt
+from response_parsers import parse_training_plan_response
 import re
 import copy
+
+logging.basicConfig(level=logging.DEBUG if settings.DEBUG else logging.INFO)
+rag_logger = logging.getLogger("fitmind_ai.rag")
 
 # =====================
 # 🧠 EMBEDDINGS
@@ -1858,8 +1865,7 @@ async def search_foods_api(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/generate-training-plan")
-async def generate_training_plan(request: GenerateTrainingRequest):
+def generate_training_plan_rule_based(request: GenerateTrainingRequest):
     try:
         goal = str(request.user_summary.goal or "").strip().lower().replace(" ", "_")
         level = str(request.user_summary.level or "beginner").strip().lower()
@@ -2116,6 +2122,250 @@ async def generate_training_plan(request: GenerateTrainingRequest):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))  
+
+def model_to_plain_dict(model):
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    if hasattr(model, "dict"):
+        return model.dict()
+    return dict(model or {})
+
+def first_training_preference(preferences: Dict[str, Any], keys: List[str]):
+    for key in keys:
+        value = preferences.get(key)
+        if value not in [None, "", []]:
+            return value
+    return None
+
+def build_training_rag_search_query(request: GenerateTrainingRequest):
+    user = request.user_summary
+    preferences = request.preferences or {}
+    pieces = [
+        str(user.level or "beginner"),
+        str(user.goal or "fitness"),
+        "training plan exercises",
+    ]
+
+    days_per_week = first_training_preference(
+        preferences,
+        ["days_per_week", "training_days_per_week", "available_days", "workout_days"],
+    )
+    if days_per_week:
+        pieces.append(f"{days_per_week} days per week")
+
+    split = first_training_preference(preferences, ["preferred_split", "split", "training_split"])
+    if split:
+        pieces.append(str(split))
+
+    for weak_point in (user.weak_points or [])[:3]:
+        pieces.append(f"weak point {weak_point}")
+
+    for injury in (user.injuries or [])[:3]:
+        pieces.append(f"safe exercise for {injury}")
+
+    for liked in (preferences.get("liked_exercises", []) or [])[:3]:
+        pieces.append(str(liked))
+
+    return " ".join(str(piece).strip() for piece in pieces if str(piece).strip())
+
+def build_training_user_payload(request: GenerateTrainingRequest, retrieval_query: str):
+    preferences = request.preferences or {}
+    return {
+        "user_summary": model_to_plain_dict(request.user_summary),
+        "preferences": preferences,
+        "previous_plans": request.previous_plans or [],
+        "retrieval_query": retrieval_query,
+        "days_per_week": first_training_preference(
+            preferences,
+            ["days_per_week", "training_days_per_week", "available_days", "workout_days"],
+        ),
+    }
+
+class RAGGenerationError(RuntimeError):
+    def __init__(self, category: str, message: str, original_error: Exception = None):
+        super().__init__(message)
+        self.category = category
+        self.original_error = original_error
+
+def sanitize_rag_error_message(error: Exception, max_len: int = 240):
+    message = str(error or "")
+    if settings.OPENROUTER_API_KEY:
+        message = message.replace(settings.OPENROUTER_API_KEY, "[redacted]")
+    message = re.sub(r"\s+", " ", message).strip()
+    if len(message) > max_len:
+        return message[:max_len].rstrip() + "..."
+    return message
+
+def log_rag_exception(stage: str, error: Exception):
+    rag_logger.warning(
+        "training_rag.%s failed: %s: %s",
+        stage,
+        type(error).__name__,
+        sanitize_rag_error_message(error),
+    )
+
+def classify_openrouter_error(error: Exception):
+    message = str(error or "")
+    if "OPENROUTER_API_KEY" in message or "OPENROUTER_MODEL" in message:
+        return "openrouter_not_configured"
+    if "timed out" in message.lower() or "timeout" in type(error).__name__.lower():
+        return "openrouter_timeout"
+    if "status " in message and "OpenRouter request failed" in message:
+        return "openrouter_http_error"
+    if "empty assistant message content" in message or "did not contain assistant message content" in message:
+        return "llm_empty_response"
+    return "rag_generation_failed"
+
+def safe_training_fallback_reason(error: Exception):
+    if isinstance(error, RAGGenerationError):
+        return error.category
+
+    message = str(error or "")
+    if "OPENROUTER_API_KEY" in message or "OPENROUTER_MODEL" in message:
+        return "openrouter_not_configured"
+    if "timed out" in message.lower():
+        return "openrouter_timeout"
+    if "OpenRouter request failed with status" in message:
+        return "openrouter_http_error"
+    if "empty assistant message content" in message or "did not contain assistant message content" in message:
+        return "llm_empty_response"
+    if "No retrieved exercises" in message:
+        return "no_retrieved_exercises"
+    if "No valid JSON object" in message or "No response text" in message or "JSON" in message:
+        return "invalid_llm_json"
+    if "validation" in message.lower():
+        return "rag_schema_validation_failed"
+    return "rag_generation_failed"
+
+def rag_debug_error_type(error: Exception):
+    if isinstance(error, RAGGenerationError):
+        return error.category
+    return safe_training_fallback_reason(error)
+
+def training_rag_response_to_legacy_response(rag_response, request: GenerateTrainingRequest):
+    schedule = []
+    for day in rag_response.days:
+        exercises = []
+        for exercise in day.exercises:
+            exercises.append({
+                "exercise_id": exercise.exercise_id,
+                "name": exercise.name,
+                "sets": exercise.sets,
+                "reps": exercise.reps,
+                "rest_seconds": exercise.rest_seconds if exercise.rest_seconds is not None else 90,
+                "intensity": exercise.intensity,
+                "reason": exercise.reason,
+                "source_id": exercise.source_id,
+            })
+
+        schedule.append({
+            "day": day.day,
+            "focus": day.focus,
+            "exercises": exercises,
+        })
+
+    if not schedule:
+        raise ValueError("LLM response did not include training days")
+    if not any(day["exercises"] for day in schedule):
+        raise ValueError("LLM response did not include usable exercises")
+
+    return {
+        "status": rag_response.status,
+        "plan_id": f"plan_{request.user_summary.user_id}_{int(datetime.now().timestamp())}",
+        "version": 1,
+        "generated_at": datetime.now().isoformat(),
+        "plan_data": {
+            "duration_weeks": 4,
+            "schedule": schedule,
+        },
+        "generation_mode": "rag",
+        "rag_summary": rag_response.summary,
+        "sources": [model_to_plain_dict(source) for source in rag_response.sources],
+        "injury_warnings": rag_response.injury_warnings,
+    }
+
+def generate_training_plan_rag(request: GenerateTrainingRequest):
+    retrieval_query = build_training_rag_search_query(request)
+    rag_logger.info("training_rag.retrieval_start user_id=%s", request.user_summary.user_id)
+
+    try:
+        results = search_exercises(retrieval_query, n_results=30)
+        retrieved_items = unpack_chroma_results(results)
+    except Exception as error:
+        log_rag_exception("retrieval", error)
+        raise RAGGenerationError("rag_generation_failed", sanitize_rag_error_message(error), error) from error
+
+    rag_logger.info("training_rag.retrieval_done retrieved_exercises=%s", len(retrieved_items))
+    if not retrieved_items:
+        message = "No retrieved exercises found for RAG training generation"
+        rag_logger.warning("training_rag.retrieval_empty: %s", message)
+        raise RAGGenerationError("no_retrieved_exercises", message)
+
+    exercise_context = build_exercise_context(results)
+    if not exercise_context.strip():
+        message = "No retrieved exercises found for RAG training generation"
+        rag_logger.warning("training_rag.context_empty: %s", message)
+        raise RAGGenerationError("no_retrieved_exercises", message)
+
+    user_payload = build_training_user_payload(request, retrieval_query)
+    messages = build_training_plan_prompt(user_payload, exercise_context)
+    rag_logger.info(
+        "training_rag.prompt_built message_count=%s context_chars=%s",
+        len(messages),
+        len(exercise_context),
+    )
+
+    try:
+        rag_logger.info("training_rag.openrouter_call_start")
+        llm_text = call_openrouter_chat(messages)
+        rag_logger.info("training_rag.openrouter_call_done response_chars=%s", len(llm_text or ""))
+    except Exception as error:
+        log_rag_exception("openrouter_call", error)
+        category = classify_openrouter_error(error)
+        raise RAGGenerationError(category, sanitize_rag_error_message(error), error) from error
+
+    try:
+        rag_response = parse_training_plan_response(llm_text)
+        rag_logger.info("training_rag.parse_done")
+    except ValidationError as error:
+        log_rag_exception("parse_validation", error)
+        raise RAGGenerationError(
+            "rag_schema_validation_failed",
+            sanitize_rag_error_message(error),
+            error,
+        ) from error
+    except ValueError as error:
+        log_rag_exception("parse_json", error)
+        raise RAGGenerationError("invalid_llm_json", sanitize_rag_error_message(error), error) from error
+    except Exception as error:
+        log_rag_exception("parse_unknown", error)
+        raise RAGGenerationError("invalid_llm_json", sanitize_rag_error_message(error), error) from error
+
+    try:
+        response = training_rag_response_to_legacy_response(rag_response, request)
+        rag_logger.info("training_rag.legacy_conversion_done")
+        return response
+    except Exception as error:
+        log_rag_exception("legacy_conversion", error)
+        raise RAGGenerationError(
+            "rag_legacy_conversion_failed",
+            sanitize_rag_error_message(error),
+            error,
+        ) from error
+
+@app.post("/generate-training-plan")
+async def generate_training_plan(request: GenerateTrainingRequest):
+    try:
+        return generate_training_plan_rag(request)
+    except Exception as rag_error:
+        fallback = generate_training_plan_rule_based(request)
+        fallback["generation_mode"] = "rule_based_fallback"
+        fallback["fallback_reason"] = safe_training_fallback_reason(rag_error)
+        if settings.DEBUG:
+            fallback["rag_debug_error_type"] = rag_debug_error_type(rag_error)
+            fallback["rag_debug_error_message"] = sanitize_rag_error_message(rag_error)
+        fallback.setdefault("status", "success")
+        return fallback
 
 @app.post("/modify-training-plan")
 async def modify_training_plan(request: SmartModifyTrainingRequest):
