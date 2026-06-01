@@ -38,13 +38,14 @@ class Settings:
         self.DB_PASSWORD = os.getenv("DB_PASSWORD", "")
         self.DB_DATABASE = os.getenv("DB_DATABASE", "gym")
 
-        # Embedding/LLM provider configuration. OpenRouter is configured for
-        # future phases only; Phase 1 does not call it.
+        # Embedding/LLM provider configuration.
+        self.LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").strip().lower() or "gemini"
         self.GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
         self.GEMINI_EMBEDDING_MODEL = os.getenv(
             "GEMINI_EMBEDDING_MODEL",
             "models/gemini-embedding-2-preview",
         )
+        self.GEMINI_GENERATION_MODEL = os.getenv("GEMINI_GENERATION_MODEL", "gemini-2.5-flash")
         self.OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
         self.OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "")
 

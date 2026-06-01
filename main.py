@@ -14,9 +14,10 @@ import traceback
 import logging
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from config import settings
-from llm_client import call_openrouter_chat
-from prompt_builders import build_training_plan_prompt
-from response_parsers import parse_training_plan_response
+from llm_client import call_llm_chat
+from prompt_builders import build_training_plan_prompt, build_nutrition_plan_prompt
+from rag_schemas import training_plan_response_schema, nutrition_plan_response_schema
+from response_parsers import parse_training_plan_response, parse_nutrition_plan_response
 import re
 import copy
 
@@ -2191,6 +2192,8 @@ def sanitize_rag_error_message(error: Exception, max_len: int = 240):
     message = str(error or "")
     if settings.OPENROUTER_API_KEY:
         message = message.replace(settings.OPENROUTER_API_KEY, "[redacted]")
+    if settings.GEMINI_API_KEY:
+        message = message.replace(settings.GEMINI_API_KEY, "[redacted]")
     message = re.sub(r"\s+", " ", message).strip()
     if len(message) > max_len:
         return message[:max_len].rstrip() + "..."
@@ -2204,17 +2207,25 @@ def log_rag_exception(stage: str, error: Exception):
         sanitize_rag_error_message(error),
     )
 
-def classify_openrouter_error(error: Exception):
+def classify_llm_error(error: Exception):
     message = str(error or "")
     if "OPENROUTER_API_KEY" in message or "OPENROUTER_MODEL" in message:
         return "openrouter_not_configured"
+    if "GEMINI_API_KEY" in message or "GEMINI_GENERATION_MODEL" in message:
+        return "gemini_generation_failed"
     if "timed out" in message.lower() or "timeout" in type(error).__name__.lower():
-        return "openrouter_timeout"
+        return "gemini_generation_failed" if "Gemini" in message else "openrouter_timeout"
     if "status " in message and "OpenRouter request failed" in message:
         return "openrouter_http_error"
+    if "Gemini request failed" in message or "Gemini returned" in message:
+        if "empty assistant text" in message or "did not contain assistant text" in message:
+            return "llm_empty_response"
+        return "gemini_generation_failed"
+    if "Unsupported LLM_PROVIDER" in message:
+        return "llm_generation_failed"
     if "empty assistant message content" in message or "did not contain assistant message content" in message:
         return "llm_empty_response"
-    return "rag_generation_failed"
+    return "llm_generation_failed"
 
 def safe_training_fallback_reason(error: Exception):
     if isinstance(error, RAGGenerationError):
@@ -2223,10 +2234,18 @@ def safe_training_fallback_reason(error: Exception):
     message = str(error or "")
     if "OPENROUTER_API_KEY" in message or "OPENROUTER_MODEL" in message:
         return "openrouter_not_configured"
+    if "GEMINI_API_KEY" in message or "GEMINI_GENERATION_MODEL" in message:
+        return "gemini_generation_failed"
     if "timed out" in message.lower():
-        return "openrouter_timeout"
+        return "gemini_generation_failed" if "Gemini" in message else "openrouter_timeout"
     if "OpenRouter request failed with status" in message:
         return "openrouter_http_error"
+    if "Gemini request failed" in message or "Gemini returned" in message:
+        if "empty assistant text" in message or "did not contain assistant text" in message:
+            return "llm_empty_response"
+        return "gemini_generation_failed"
+    if "Unsupported LLM_PROVIDER" in message:
+        return "llm_generation_failed"
     if "empty assistant message content" in message or "did not contain assistant message content" in message:
         return "llm_empty_response"
     if "No retrieved exercises" in message:
@@ -2316,12 +2335,12 @@ def generate_training_plan_rag(request: GenerateTrainingRequest):
     )
 
     try:
-        rag_logger.info("training_rag.openrouter_call_start")
-        llm_text = call_openrouter_chat(messages)
-        rag_logger.info("training_rag.openrouter_call_done response_chars=%s", len(llm_text or ""))
+        rag_logger.info("training_rag.llm_call_start provider=%s", settings.LLM_PROVIDER)
+        llm_text = call_llm_chat(messages, response_schema=training_plan_response_schema())
+        rag_logger.info("training_rag.llm_call_done provider=%s response_chars=%s", settings.LLM_PROVIDER, len(llm_text or ""))
     except Exception as error:
-        log_rag_exception("openrouter_call", error)
-        category = classify_openrouter_error(error)
+        log_rag_exception("llm_call", error)
+        category = classify_llm_error(error)
         raise RAGGenerationError(category, sanitize_rag_error_message(error), error) from error
 
     try:
@@ -2457,8 +2476,7 @@ def food_matches_restrictions(food_name: str, blocked_terms):
     return False
 
 
-@app.post("/generate-nutrition-plan")
-async def generate_nutrition_plan(request: GenerateNutritionRequest):
+def generate_nutrition_plan_rule_based(request: GenerateNutritionRequest):
     try:
         goal = normalize_term(request.user_summary.goal or "").replace(" ", "_")
         preferences = request.preferences or {}
@@ -2630,6 +2648,399 @@ async def generate_nutrition_plan(request: GenerateNutritionRequest):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+def first_nutrition_preference(preferences: Dict[str, Any], keys: List[str]):
+    for key in keys:
+        value = preferences.get(key)
+        if value not in [None, "", []]:
+            return value
+    return None
+
+def as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str):
+        return [item.strip() for item in re.split(r"[,\n/]+", value) if item.strip()]
+    return [value]
+
+def numeric_value(value):
+    parsed = safe_float(value, None)
+    if parsed is not None:
+        return parsed
+    match = re.search(r"-?\d+(?:\.\d+)?", safe_str(value))
+    if match:
+        return safe_float(match.group(0), None)
+    return None
+
+def normalize_nutrition_target_macros(target_macros):
+    if not target_macros:
+        return None
+
+    macros = model_to_plain_dict(target_macros)
+    protein = numeric_value(first_present(macros.get("protein_g"), macros.get("protein")))
+    carbs = numeric_value(first_present(macros.get("carbs_g"), macros.get("carbs")))
+    fat = numeric_value(first_present(macros.get("fat_g"), macros.get("fat")))
+
+    if protein is None and carbs is None and fat is None:
+        return None
+
+    return {
+        "protein_g": protein if protein is not None else 0.0,
+        "carbs_g": carbs if carbs is not None else 0.0,
+        "fat_g": fat if fat is not None else 0.0,
+    }
+
+def estimate_calories_from_macros(normalized_target_macros):
+    if not normalized_target_macros:
+        return None
+    protein = normalized_target_macros.get("protein_g")
+    carbs = normalized_target_macros.get("carbs_g")
+    fat = normalized_target_macros.get("fat_g")
+    if protein is None or carbs is None or fat is None:
+        return None
+    return round((protein * 4) + (carbs * 4) + (fat * 9), 2)
+
+def round_nutrition_totals(totals):
+    return {
+        "calories": round(safe_float(totals.get("calories")), 2),
+        "protein": round(safe_float(totals.get("protein")), 2),
+        "carbs": round(safe_float(totals.get("carbs")), 2),
+        "fat": round(safe_float(totals.get("fat")), 2),
+    }
+
+def build_nutrition_rag_search_query(request: GenerateNutritionRequest):
+    user = request.user_summary
+    preferences = request.preferences or {}
+    normalized_target_macros = normalize_nutrition_target_macros(request.target_macros)
+    estimated_target_calories = estimate_calories_from_macros(normalized_target_macros)
+    pieces = [
+        str(user.goal or "balanced"),
+        "nutrition plan foods",
+    ]
+
+    dietary_preference = first_nutrition_preference(
+        preferences,
+        ["dietary_preference", "diet_type", "preferred_diet", "nutrition_preference"],
+    )
+    if dietary_preference:
+        pieces.append(str(dietary_preference))
+
+    meal_count = first_nutrition_preference(preferences, ["meal_count", "meals_per_day", "number_of_meals"])
+    if meal_count:
+        pieces.append(f"{meal_count} meals per day")
+
+    target_calories = first_nutrition_preference(
+        preferences,
+        ["daily_calorie_target", "target_calories", "calorie_target", "calories"],
+    )
+    if target_calories:
+        pieces.append(f"{target_calories} calorie target")
+    elif estimated_target_calories:
+        pieces.append(f"{estimated_target_calories:g} calorie target")
+
+    if normalized_target_macros:
+        pieces.append(f"{normalized_target_macros['protein_g']:g}g protein")
+        pieces.append(f"{normalized_target_macros['carbs_g']:g}g carbs")
+        pieces.append(f"{normalized_target_macros['fat_g']:g}g fat")
+
+    liked_foods = as_list(preferences.get("liked_foods"))
+    for liked in liked_foods[:5]:
+        pieces.append(str(liked))
+
+    if preferences.get("food_allergies") or preferences.get("allergies"):
+        pieces.append("allergy aware safe foods")
+
+    return " ".join(str(piece).strip() for piece in pieces if str(piece).strip())
+
+def build_nutrition_user_payload(request: GenerateNutritionRequest, retrieval_query: str):
+    preferences = request.preferences or {}
+    normalized_target_macros = normalize_nutrition_target_macros(request.target_macros)
+    estimated_target_calories = estimate_calories_from_macros(normalized_target_macros)
+    meal_count = first_nutrition_preference(preferences, ["meal_count", "meals_per_day", "number_of_meals"])
+    allergies = as_list(first_present(preferences.get("food_allergies"), preferences.get("allergies")))
+    liked_foods = as_list(preferences.get("liked_foods"))
+    disliked_foods = as_list(preferences.get("disliked_foods"))
+
+    return {
+        "user_summary": model_to_plain_dict(request.user_summary),
+        "preferences": preferences,
+        "target_macros": model_to_plain_dict(request.target_macros) if request.target_macros else None,
+        "normalized_target_macros": normalized_target_macros,
+        "estimated_target_calories": estimated_target_calories,
+        "target_calories": first_nutrition_preference(
+            preferences,
+            ["daily_calorie_target", "target_calories", "calorie_target", "calories"],
+        ),
+        "meal_count": meal_count,
+        "dietary_preference": first_nutrition_preference(
+            preferences,
+            ["dietary_preference", "diet_type", "preferred_diet", "nutrition_preference"],
+        ),
+        "allergies": allergies,
+        "liked_foods": liked_foods,
+        "disliked_foods": disliked_foods,
+        "retrieval_query": retrieval_query,
+    }
+
+def log_nutrition_rag_exception(stage: str, error: Exception):
+    rag_logger.warning(
+        "nutrition_rag.%s failed: %s: %s",
+        stage,
+        type(error).__name__,
+        sanitize_rag_error_message(error),
+    )
+
+def safe_nutrition_fallback_reason(error: Exception):
+    if isinstance(error, RAGGenerationError):
+        return error.category
+
+    message = str(error or "")
+    if "OPENROUTER_API_KEY" in message or "OPENROUTER_MODEL" in message:
+        return "openrouter_not_configured"
+    if "GEMINI_API_KEY" in message or "GEMINI_GENERATION_MODEL" in message:
+        return "gemini_generation_failed"
+    if "timed out" in message.lower():
+        return "gemini_generation_failed" if "Gemini" in message else "openrouter_timeout"
+    if "OpenRouter request failed with status" in message:
+        return "openrouter_http_error"
+    if "Gemini request failed" in message or "Gemini returned" in message:
+        if "empty assistant text" in message or "did not contain assistant text" in message:
+            return "llm_empty_response"
+        return "gemini_generation_failed"
+    if "Unsupported LLM_PROVIDER" in message:
+        return "llm_generation_failed"
+    if "empty assistant message content" in message or "did not contain assistant message content" in message:
+        return "llm_empty_response"
+    if "No retrieved foods" in message:
+        return "no_retrieved_foods"
+    if "nutrition totals too low" in message.lower() or "below 60%" in message:
+        return "nutrition_totals_too_low"
+    if "No valid JSON object" in message or "No response text" in message or "JSON" in message:
+        return "invalid_llm_json"
+    if "validation" in message.lower():
+        return "rag_schema_validation_failed"
+    return "rag_generation_failed"
+
+def food_item_prompt_score(item):
+    score = distance_to_score(item.get("distance"))
+    if score is not None:
+        return score
+    distance = safe_float(item.get("distance"), None)
+    if distance is not None:
+        return -distance
+    return 0.0
+
+def deduplicate_food_results_for_prompt(results):
+    deduped = {}
+    for item in unpack_chroma_results(results):
+        meta = item.get("metadata") or {}
+        name_key = normalize_term(meta.get("name") or item.get("id") or "")
+        if not name_key:
+            name_key = safe_str(item.get("id"))
+        if not name_key:
+            continue
+
+        existing = deduped.get(name_key)
+        if existing is None or food_item_prompt_score(item) > food_item_prompt_score(existing):
+            deduped[name_key] = item
+
+    return pack_chroma_results(list(deduped.values()))
+
+def nutrition_rag_response_to_legacy_response(rag_response, request: GenerateNutritionRequest):
+    daily_meals = []
+    total_daily = {"calories": 0.0, "protein": 0.0, "carbs": 0.0, "fat": 0.0}
+    normalized_target_macros = normalize_nutrition_target_macros(request.target_macros)
+    estimated_target_calories = estimate_calories_from_macros(normalized_target_macros)
+
+    for meal in rag_response.meals:
+        items = []
+        for food in meal.foods:
+            quantity = food.quantity
+            quantity_number = safe_float(quantity, 1.0)
+            if quantity_number <= 0:
+                quantity_number = 1.0
+
+            item = {
+                "food_id": food.food_id,
+                "name": food.name,
+                "serving_size": food.serving_size,
+                "quantity": quantity,
+                "calories": food.calories,
+                "protein": food.protein,
+                "carbs": food.carbs,
+                "fat": food.fat,
+                "reason": food.reason,
+                "source_id": food.source_id,
+            }
+            items.append(item)
+
+            total_daily["calories"] += food.calories * quantity_number
+            total_daily["protein"] += food.protein * quantity_number
+            total_daily["carbs"] += food.carbs * quantity_number
+            total_daily["fat"] += food.fat * quantity_number
+
+        daily_meals.append({
+            "meal": meal.meal,
+            "items": items,
+        })
+
+    if not daily_meals:
+        raise ValueError("LLM response did not include nutrition meals")
+    if not any(meal["items"] for meal in daily_meals):
+        raise ValueError("LLM response did not include usable foods")
+
+    total_daily = round_nutrition_totals(total_daily)
+    rag_logger.info(
+        "nutrition_rag.total_daily_recalculated calories=%s protein=%s carbs=%s fat=%s estimated_target_calories=%s",
+        total_daily["calories"],
+        total_daily["protein"],
+        total_daily["carbs"],
+        total_daily["fat"],
+        estimated_target_calories,
+    )
+
+    if estimated_target_calories and total_daily["calories"] < (estimated_target_calories * 0.6):
+        message = (
+            f"Nutrition totals too low: recalculated calories {total_daily['calories']:g} "
+            f"below 60% of estimated target calories {estimated_target_calories:g}"
+        )
+        rag_logger.warning(
+            "nutrition_rag.nutrition_totals_too_low triggered total_calories=%s threshold=%s estimated_target_calories=%s",
+            total_daily["calories"],
+            round(estimated_target_calories * 0.6, 2),
+            estimated_target_calories,
+        )
+        raise RAGGenerationError("nutrition_totals_too_low", message)
+
+    macro_targets = normalized_target_macros or model_to_plain_dict(rag_response.macro_targets)
+
+    return {
+        "status": rag_response.status,
+        "plan_id": f"meal_{request.user_summary.user_id}_{int(datetime.now().timestamp())}",
+        "version": 1,
+        "generated_at": datetime.now().isoformat(),
+        "daily_meals": daily_meals,
+        "total_daily": total_daily,
+        "daily_calorie_target": estimated_target_calories or rag_response.daily_calorie_target,
+        "macro_targets": macro_targets,
+        "generation_mode": "rag",
+        "rag_summary": getattr(
+            rag_response,
+            "summary",
+            "Nutrition plan generated from retrieved food context.",
+        ),
+        "sources": [model_to_plain_dict(source) for source in rag_response.sources],
+        "allergy_warnings": rag_response.allergy_warnings,
+    }
+
+def generate_nutrition_plan_rag(request: GenerateNutritionRequest):
+    retrieval_query = build_nutrition_rag_search_query(request)
+    normalized_target_macros = normalize_nutrition_target_macros(request.target_macros)
+    estimated_target_calories = estimate_calories_from_macros(normalized_target_macros)
+    rag_logger.info(
+        "nutrition_rag.target_macros received=%s normalized=%s estimated_target_calories=%s",
+        bool(request.target_macros),
+        normalized_target_macros,
+        estimated_target_calories,
+    )
+    rag_logger.info("nutrition_rag.retrieval_start user_id=%s", request.user_summary.user_id)
+
+    try:
+        results = search_nutrition(retrieval_query, n_results=30)
+        retrieved_items = unpack_chroma_results(results)
+    except Exception as error:
+        log_nutrition_rag_exception("retrieval", error)
+        raise RAGGenerationError("rag_generation_failed", sanitize_rag_error_message(error), error) from error
+
+    rag_logger.info("nutrition_rag.retrieval_done retrieved_foods=%s", len(retrieved_items))
+    if not retrieved_items:
+        message = "No retrieved foods found for RAG nutrition generation"
+        rag_logger.warning("nutrition_rag.retrieval_empty: %s", message)
+        raise RAGGenerationError("no_retrieved_foods", message)
+
+    prompt_results = deduplicate_food_results_for_prompt(results)
+    deduped_items = unpack_chroma_results(prompt_results)
+    rag_logger.info(
+        "nutrition_rag.prompt_dedup_done original_foods=%s deduped_foods=%s",
+        len(retrieved_items),
+        len(deduped_items),
+    )
+    if not deduped_items:
+        message = "No retrieved foods found for RAG nutrition generation"
+        rag_logger.warning("nutrition_rag.dedup_empty: %s", message)
+        raise RAGGenerationError("no_retrieved_foods", message)
+
+    food_context = build_food_context(prompt_results)
+    if not food_context.strip():
+        message = "No retrieved foods found for RAG nutrition generation"
+        rag_logger.warning("nutrition_rag.context_empty: %s", message)
+        raise RAGGenerationError("no_retrieved_foods", message)
+
+    user_payload = build_nutrition_user_payload(request, retrieval_query)
+    messages = build_nutrition_plan_prompt(user_payload, food_context)
+    rag_logger.info(
+        "nutrition_rag.prompt_built message_count=%s context_chars=%s",
+        len(messages),
+        len(food_context),
+    )
+
+    try:
+        rag_logger.info("nutrition_rag.llm_call_start provider=%s", settings.LLM_PROVIDER)
+        llm_text = call_llm_chat(messages, response_schema=nutrition_plan_response_schema())
+        rag_logger.info("nutrition_rag.llm_call_done provider=%s response_chars=%s", settings.LLM_PROVIDER, len(llm_text or ""))
+    except Exception as error:
+        log_nutrition_rag_exception("llm_call", error)
+        category = classify_llm_error(error)
+        raise RAGGenerationError(category, sanitize_rag_error_message(error), error) from error
+
+    try:
+        rag_response = parse_nutrition_plan_response(llm_text)
+        rag_logger.info("nutrition_rag.parse_done")
+    except ValidationError as error:
+        log_nutrition_rag_exception("parse_validation", error)
+        raise RAGGenerationError(
+            "rag_schema_validation_failed",
+            sanitize_rag_error_message(error),
+            error,
+        ) from error
+    except ValueError as error:
+        log_nutrition_rag_exception("parse_json", error)
+        raise RAGGenerationError("invalid_llm_json", sanitize_rag_error_message(error), error) from error
+    except Exception as error:
+        log_nutrition_rag_exception("parse_unknown", error)
+        raise RAGGenerationError("invalid_llm_json", sanitize_rag_error_message(error), error) from error
+
+    try:
+        response = nutrition_rag_response_to_legacy_response(rag_response, request)
+        rag_logger.info("nutrition_rag.legacy_conversion_done")
+        return response
+    except RAGGenerationError:
+        raise
+    except Exception as error:
+        log_nutrition_rag_exception("legacy_conversion", error)
+        raise RAGGenerationError(
+            "rag_legacy_conversion_failed",
+            sanitize_rag_error_message(error),
+            error,
+        ) from error
+
+@app.post("/generate-nutrition-plan")
+async def generate_nutrition_plan(request: GenerateNutritionRequest):
+    try:
+        return generate_nutrition_plan_rag(request)
+    except Exception as rag_error:
+        fallback = generate_nutrition_plan_rule_based(request)
+        fallback["generation_mode"] = "rule_based_fallback"
+        fallback["fallback_reason"] = safe_nutrition_fallback_reason(rag_error)
+        if settings.DEBUG:
+            fallback["rag_debug_error_type"] = rag_debug_error_type(rag_error)
+            fallback["rag_debug_error_message"] = sanitize_rag_error_message(rag_error)
+        fallback.setdefault("status", "success")
+        return fallback
 
 
 def analyze_nutrition_and_suggest_modifications(current_plan, user_feedback, search_func):

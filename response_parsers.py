@@ -46,6 +46,27 @@ def parse_training_plan_response(text: str) -> TrainingPlanRAGResponse:
     return TrainingPlanRAGResponse.model_validate(data)
 
 
+def normalize_nutrition_food_source_ids(data: Dict[str, Any]) -> Dict[str, Any]:
+    meals = data.get("meals", [])
+    if not isinstance(meals, list):
+        return data
+
+    for meal in meals:
+        if not isinstance(meal, dict):
+            continue
+        foods = meal.get("foods", [])
+        if not isinstance(foods, list):
+            continue
+        for food in foods:
+            if not isinstance(food, dict):
+                continue
+            if food.get("source_id") in [None, ""] and food.get("food_id") not in [None, ""]:
+                food["source_id"] = food["food_id"]
+
+    return data
+
+
 def parse_nutrition_plan_response(text: str) -> NutritionPlanRAGResponse:
     data = extract_json_object(text)
+    data = normalize_nutrition_food_source_ids(data)
     return NutritionPlanRAGResponse.model_validate(data)
