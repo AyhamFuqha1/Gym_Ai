@@ -6,6 +6,56 @@ def _json_payload(payload: Dict[str, Any]) -> str:
     return json.dumps(payload or {}, ensure_ascii=False, indent=2, default=str)
 
 
+def build_chat_assistant_prompt(
+    user_payload: dict,
+    exercise_context: str = "",
+    food_context: str = "",
+) -> List[Dict[str, str]]:
+    system_prompt = (
+        "You are FitMind Assistant, a safe, practical fitness and nutrition chatbot. "
+        "Answer using the user's message, profile, active injuries, current training "
+        "plan, current nutrition plan, and retrieved exercise or food context when "
+        "provided. Keep answers short, concrete, and useful. Do not provide medical "
+        "diagnosis or claim an exercise is medically safe. If an injury is relevant, "
+        "tell the user to avoid painful movements and consult a coach or clinician "
+        "when pain, swelling, instability, numbness, or sharp symptoms occur. Do not "
+        "directly modify training or nutrition plans. If the user asks to change, "
+        "replace, edit, add, remove, or update a plan, tell them to submit a "
+        "modification request for coach review. Return one JSON object only, with no "
+        "markdown or text outside JSON."
+    )
+    user_prompt = (
+        "Answer this FitMind Assistant chat request.\n\n"
+        "Response rules:\n"
+        "- Return exactly one top-level JSON object.\n"
+        "- Required keys: status, answer, warnings, sources.\n"
+        "- status must be success.\n"
+        "- answer should be 2 to 5 short sentences.\n"
+        "- warnings should be an array of short safety warnings, or [] if none.\n"
+        "- sources should include only retrieved sources that directly informed the answer.\n"
+        "- Do not diagnose injuries or medical conditions.\n"
+        "- Do not directly modify training_plan or nutrition_plan.\n"
+        "- If the request asks for a plan change, answer with the coach-review modification request guidance.\n\n"
+        "Required JSON shape:\n"
+        "{\n"
+        '  "status": "success",\n'
+        '  "answer": "short practical answer",\n'
+        '  "warnings": [],\n'
+        '  "sources": [{"source_id": 1, "source_table": "exercises", "source_name": "Exercise name", "score": 0.9, "reason_used": "why this source informed the answer"}]\n'
+        "}\n\n"
+        "User payload:\n"
+        f"{_json_payload(user_payload)}\n\n"
+        "Retrieved exercise context:\n"
+        f"{exercise_context or 'No retrieved exercise context provided.'}\n\n"
+        "Retrieved food context:\n"
+        f"{food_context or 'No retrieved food context provided.'}"
+    )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
 def build_training_plan_prompt(user_payload: dict, exercise_context: str) -> List[Dict[str, str]]:
     system_prompt = (
         "You are FitMind's RAG training-plan planner. Build safe, practical gym plans "

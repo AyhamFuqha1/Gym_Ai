@@ -1,7 +1,7 @@
 # main.py
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from typing import Optional, List, Dict, Any, Union
 from datetime import datetime
 import os
@@ -16,18 +16,21 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from config import settings
 from llm_client import call_llm_chat
 from prompt_builders import (
+    build_chat_assistant_prompt,
     build_modify_nutrition_plan_prompt,
     build_modify_training_plan_prompt,
     build_nutrition_plan_prompt,
     build_training_plan_prompt,
 )
 from rag_schemas import (
+    chat_assistant_response_schema,
     modified_nutrition_plan_response_schema,
     modified_training_plan_response_schema,
     nutrition_plan_response_schema,
     training_plan_response_schema,
 )
 from response_parsers import (
+    parse_chat_assistant_response,
     parse_modified_nutrition_plan_response,
     parse_modified_training_plan_response,
     parse_nutrition_plan_response,
@@ -1191,6 +1194,40 @@ class SearchRequest(BaseModel):
     exclude_junk: Optional[bool] = True
     debug_context: Optional[bool] = False
 
+class ChatProfile(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    age: Optional[int] = None
+    gender: Optional[str] = None
+    height: Optional[float] = None
+    weight: Optional[float] = None
+    activity_level: Optional[str] = None
+    goal: Optional[str] = None
+    level: Optional[str] = None
+
+class ChatInjury(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    injury_type: Optional[str] = None
+    severity: Optional[str] = None
+    notes: Optional[str] = None
+    status: Optional[str] = None
+
+class ChatRequest(BaseModel):
+    user_id: Union[int, str]
+    message: str
+    profile: Optional[ChatProfile] = None
+    injuries: List[ChatInjury] = []
+    training_plan: Dict[str, Any] = {}
+    nutrition_plan: Dict[str, Any] = {}
+
+    @field_validator("message")
+    @classmethod
+    def message_must_not_be_empty(cls, value):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("message is required")
+        return value.strip()
+
 class SmartModifyTrainingRequest(BaseModel):
     current_plan_id: Optional[Union[int, str]] = None
     current_plan: Dict[str, Any]
@@ -1804,6 +1841,384 @@ def format_search_response(query: str, result_type: str, results: Dict[str, Any]
             else build_food_context(results)
         )
     return response
+
+EXERCISE_CHAT_KEYWORDS = [
+    "exercise", "workout", "training", "gym", "plan", "program", "sets", "reps",
+    "muscle", "leg press", "squat", "lunge", "deadlift", "bench", "press", "row",
+    "curl", "pushup", "push-up", "pullup", "pull-up", "cardio", "stretch",
+    "knee", "shoulder", "elbow", "wrist", "back", "neck", "ankle", "hip",
+    "injury", "pain", "sore", "safe", "form",
+]
+NUTRITION_CHAT_KEYWORDS = [
+    "food", "nutrition", "diet", "meal", "eat", "calorie", "calories", "kcal",
+    "protein", "carb", "carbs", "fat", "macro", "macros", "breakfast", "lunch",
+    "dinner", "snack", "allergy", "allergies", "hungry", "weight", "water",
+    "supplement", "fiber", "sugar",
+]
+PLAN_MODIFICATION_VERBS = [
+    "change", "modify", "edit", "update", "replace", "swap", "remove", "delete",
+    "add", "adjust",
+]
+PLAN_MODIFICATION_TARGETS = [
+    "plan", "program", "workout", "training", "exercise", "meal", "diet",
+    "nutrition",
+]
+
+def chat_text_contains_keyword(text: str, keyword: str):
+    keyword = safe_str(keyword).lower()
+    if not keyword:
+        return False
+    return bool(re.search(r"\b" + re.escape(keyword) + r"\b", text))
+
+def chat_text_contains_any(text: str, keywords: List[str]):
+    text = safe_str(text).lower()
+    return any(chat_text_contains_keyword(text, keyword) for keyword in keywords)
+
+def chat_message_requests_plan_modification(message: str):
+    text = safe_str(message).lower()
+    has_verb = chat_text_contains_any(text, PLAN_MODIFICATION_VERBS)
+    has_target = chat_text_contains_any(text, PLAN_MODIFICATION_TARGETS)
+    if has_verb and has_target:
+        return True
+    return bool(re.search(
+        r"\b(can you|please|i want to|i need to)\b.*\b(change|modify|edit|update|replace|swap|remove|add|adjust)\b",
+        text,
+    ))
+
+def active_chat_injuries(injuries: List[ChatInjury]):
+    active = []
+    for injury in injuries or []:
+        data = model_to_plain_dict(injury)
+        status = safe_str(data.get("status")).lower()
+        if status and status not in {"active", "current", "ongoing"}:
+            continue
+        if any(safe_str(value) for value in data.values()):
+            active.append(data)
+    return active
+
+def chat_injury_text(active_injuries: List[Dict[str, Any]]):
+    pieces = []
+    for injury in active_injuries or []:
+        injury_bits = [
+            injury.get("injury_type"),
+            injury.get("severity"),
+            injury.get("notes"),
+        ]
+        text = " ".join(safe_str(bit) for bit in injury_bits if safe_str(bit))
+        if text:
+            pieces.append(text)
+    return " ".join(pieces)
+
+def detect_chat_intents(message: str, active_injuries: List[Dict[str, Any]]):
+    text = safe_str(message).lower()
+    injury_text = chat_injury_text(active_injuries).lower()
+    exercise_related = chat_text_contains_any(text, EXERCISE_CHAT_KEYWORDS)
+    nutrition_related = chat_text_contains_any(text, NUTRITION_CHAT_KEYWORDS)
+
+    if active_injuries and any(word in text for word in ["safe", "avoid", "pain", "injury", "hurt"]):
+        exercise_related = True
+
+    # Injury names such as "left knee" should trigger exercise retrieval even
+    # when the user does not say "exercise" explicitly.
+    if injury_text and any(term in text for term in injury_text.split() if len(term) >= 4):
+        exercise_related = True
+
+    return {
+        "exercise_related": exercise_related,
+        "nutrition_related": nutrition_related,
+        "plan_modification_request": chat_message_requests_plan_modification(message),
+    }
+
+def chat_profile_to_dict(profile: Optional[ChatProfile]):
+    return model_to_plain_dict(profile) if profile else {}
+
+def build_chat_retrieval_query(
+    request: ChatRequest,
+    active_injuries: List[Dict[str, Any]],
+    retrieval_type: str,
+):
+    profile = chat_profile_to_dict(request.profile)
+    pieces = [request.message]
+
+    goal = profile.get("goal")
+    if goal:
+        pieces.append(f"goal {goal}")
+
+    if profile.get("activity_level"):
+        pieces.append(f"activity level {profile.get('activity_level')}")
+    if profile.get("level"):
+        pieces.append(f"training level {profile.get('level')}")
+
+    injury_text = chat_injury_text(active_injuries)
+    if retrieval_type == "exercises":
+        pieces.append("exercise training guidance")
+        if injury_text:
+            pieces.append(f"safe exercise guidance for {injury_text}")
+    else:
+        pieces.append("food nutrition guidance")
+        if goal:
+            pieces.append(f"{goal} nutrition foods")
+
+    return " ".join(safe_str(piece) for piece in pieces if safe_str(piece))
+
+def chat_sources_from_results(results: Dict[str, Any], source_table: str, reason: str, limit: int = 4):
+    sources = []
+    seen = set()
+    for item in unpack_chroma_results(results):
+        meta = item.get("metadata") or {}
+        source_id = first_present(meta.get("id"), item.get("id"))
+        source_name = safe_str(meta.get("name"), "Exercise" if source_table == "exercises" else "Food")
+        key = (str(source_id), source_table)
+        if source_id in [None, ""] or key in seen:
+            continue
+        seen.add(key)
+        sources.append({
+            "source_id": source_id,
+            "source_table": source_table,
+            "source_name": source_name,
+            "score": distance_to_score(item.get("distance")),
+            "reason_used": reason,
+        })
+        if len(sources) >= limit:
+            break
+    return sources
+
+def merge_chat_response_sources(llm_sources, retrieved_sources, rag_used: bool):
+    retrieved_index = {
+        (str(source.get("source_id")), source.get("source_table")): source
+        for source in (retrieved_sources or [])
+    }
+    merged = []
+    seen = set()
+
+    for source in llm_sources or []:
+        source_dict = model_to_plain_dict(source)
+        source_id = source_dict.get("source_id")
+        source_table = source_dict.get("source_table")
+        key = (str(source_id), source_table)
+        if source_id in [None, ""] or key in seen:
+            continue
+        if key in retrieved_index:
+            base = dict(retrieved_index[key])
+            if source_dict.get("reason_used"):
+                base["reason_used"] = source_dict.get("reason_used")
+            merged.append(base)
+        elif source_table in {"exercises", "foods"}:
+            merged.append(source_dict)
+        seen.add(key)
+
+    if rag_used and not merged:
+        for source in retrieved_sources or []:
+            key = (str(source.get("source_id")), source.get("source_table"))
+            if key in seen:
+                continue
+            merged.append(source)
+            seen.add(key)
+            if len(merged) >= 4:
+                break
+
+    return merged[:6]
+
+def safe_chat_fallback_reason(error: Exception):
+    if isinstance(error, RAGGenerationError):
+        return error.category
+    message = str(error or "")
+    if "No valid JSON object" in message or "No response text" in message or "JSON" in message:
+        return "invalid_llm_json"
+    if "validation" in message.lower():
+        return "rag_schema_validation_failed"
+    return classify_llm_error(error)
+
+def log_chat_exception(stage: str, error: Exception):
+    rag_logger.warning(
+        "chat.%s failed: %s: %s",
+        stage,
+        type(error).__name__,
+        sanitize_rag_error_message(error),
+    )
+
+def plan_modification_chat_response():
+    return {
+        "status": "success",
+        "answer": (
+            "I cannot directly change your training or nutrition plan in chat. "
+            "Please submit a modification request so your coach can review it safely. "
+            "Include what you want changed, why, and any injury, pain, allergy, or preference notes."
+        ),
+        "warnings": [],
+        "sources": [],
+        "generation_mode": "guardrail",
+        "fallback_reason": None,
+    }
+
+def rule_based_chat_answer(
+    request: ChatRequest,
+    intents: Dict[str, bool],
+    active_injuries: List[Dict[str, Any]],
+    sources: List[Dict[str, Any]],
+):
+    message = safe_str(request.message)
+    profile = chat_profile_to_dict(request.profile)
+    goal = safe_str(profile.get("goal"), "your goal")
+    warnings = []
+
+    if active_injuries:
+        injury_names = [
+            safe_str(injury.get("injury_type"))
+            for injury in active_injuries
+            if safe_str(injury.get("injury_type"))
+        ]
+        injury_label = ", ".join(injury_names) if injury_names else "your active injury"
+        warnings.append("Not medical advice; check with a clinician or coach for injury-specific clearance.")
+        warnings.append("Stop if you feel sharp pain, swelling, instability, numbness, or worsening symptoms.")
+        answer = (
+            f"With {injury_label}, keep the movement pain-free, controlled, and conservative. "
+            "Avoid anything that conflicts with your injury notes or causes symptoms during or after the set. "
+            "Ask your coach to review the exact exercise, load, range of motion, and alternatives."
+        )
+    elif intents.get("exercise_related"):
+        answer = (
+            f"For {goal}, keep training simple: use controlled form, moderate effort, and progress gradually. "
+            "If an exercise causes pain or poor technique, reduce load or choose an easier variation. "
+            "Your coach can review plan-specific changes."
+        )
+    elif intents.get("nutrition_related"):
+        answer = (
+            f"For {goal}, focus on consistent meals with enough protein, mostly whole foods, and calories that match the goal. "
+            "Use your current nutrition plan as the baseline, and avoid foods that conflict with allergies or medical notes. "
+            "Ask for coach review before changing the plan structure."
+        )
+    else:
+        answer = (
+            "I can help with practical fitness and nutrition questions using your profile, plans, and safety notes. "
+            "Ask about an exercise, meal, habit, or progress concern, and I will keep the guidance short and safe."
+        )
+
+    if "diagnos" in message.lower():
+        warnings.append("I cannot provide medical diagnosis.")
+
+    return {
+        "status": "success",
+        "answer": answer,
+        "warnings": unique_strings(warnings),
+        "sources": sources[:4],
+    }
+
+def generate_chat_response(request: ChatRequest):
+    active_injuries = active_chat_injuries(request.injuries)
+    intents = detect_chat_intents(request.message, active_injuries)
+
+    if intents.get("plan_modification_request"):
+        return plan_modification_chat_response()
+
+    exercise_context = ""
+    food_context = ""
+    retrieved_sources = []
+    retrieval_failures = []
+
+    if intents.get("exercise_related"):
+        try:
+            exercise_query = build_chat_retrieval_query(request, active_injuries, "exercises")
+            exercise_results = search_exercises(exercise_query, n_results=5)
+            if unpack_chroma_results(exercise_results):
+                exercise_context = build_exercise_context(exercise_results)
+                retrieved_sources.extend(chat_sources_from_results(
+                    exercise_results,
+                    "exercises",
+                    "Retrieved for the user's exercise or injury-related question.",
+                ))
+        except Exception as error:
+            retrieval_failures.append("exercise_retrieval_failed")
+            log_chat_exception("exercise_retrieval", error)
+
+    if intents.get("nutrition_related"):
+        try:
+            food_query = build_chat_retrieval_query(request, active_injuries, "foods")
+            food_results = search_nutrition(food_query, n_results=5)
+            if unpack_chroma_results(food_results):
+                food_context = build_food_context(food_results)
+                retrieved_sources.extend(chat_sources_from_results(
+                    food_results,
+                    "foods",
+                    "Retrieved for the user's food or nutrition-related question.",
+                ))
+        except Exception as error:
+            retrieval_failures.append("food_retrieval_failed")
+            log_chat_exception("food_retrieval", error)
+
+    rag_used = bool(retrieved_sources)
+    profile = chat_profile_to_dict(request.profile)
+    user_payload = {
+        "user_id": request.user_id,
+        "message": request.message,
+        "profile": profile,
+        "active_injuries": active_injuries,
+        "training_plan": request.training_plan or {},
+        "nutrition_plan": request.nutrition_plan or {},
+        "detected_intents": intents,
+        "retrieved_sources": retrieved_sources,
+    }
+    if retrieval_failures:
+        user_payload["retrieval_failures"] = retrieval_failures
+
+    messages = build_chat_assistant_prompt(user_payload, exercise_context, food_context)
+
+    try:
+        rag_logger.info(
+            "chat.llm_call_start user_id=%s provider=%s rag_used=%s",
+            request.user_id,
+            settings.LLM_PROVIDER,
+            rag_used,
+        )
+        llm_text = call_llm_chat(
+            messages,
+            temperature=0.2,
+            max_tokens=700,
+            response_schema=chat_assistant_response_schema(),
+        )
+        chat_response = parse_chat_assistant_response(llm_text)
+        answer = safe_str(chat_response.answer)
+        if not answer:
+            raise ValueError("LLM response did not include an answer")
+        response_sources = merge_chat_response_sources(
+            chat_response.sources,
+            retrieved_sources,
+            rag_used,
+        )
+        warnings = list(chat_response.warnings or [])
+        if active_injuries and intents.get("exercise_related"):
+            warnings = unique_strings(
+                warnings,
+                ["Not medical advice; consult a coach or clinician for injury-specific clearance."],
+            )
+        return {
+            "status": "success",
+            "answer": answer,
+            "warnings": warnings,
+            "sources": response_sources,
+            "generation_mode": "rag" if rag_used else "llm",
+            "fallback_reason": None,
+        }
+    except ValidationError as error:
+        log_chat_exception("parse_validation", error)
+        fallback_reason = "rag_schema_validation_failed"
+    except ValueError as error:
+        log_chat_exception("parse_json", error)
+        fallback_reason = "invalid_llm_json"
+    except Exception as error:
+        log_chat_exception("llm_call", error)
+        fallback_reason = safe_chat_fallback_reason(error)
+
+    fallback = rule_based_chat_answer(request, intents, active_injuries, retrieved_sources)
+    fallback["generation_mode"] = "rule_based_fallback"
+    fallback["fallback_reason"] = fallback_reason
+    if settings.DEBUG:
+        fallback["rag_debug_error_type"] = fallback_reason
+    return fallback
+
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    return generate_chat_response(request)
 
 @app.post("/sync-all")
 async def sync_all_data(full_sync: bool = Query(False)):

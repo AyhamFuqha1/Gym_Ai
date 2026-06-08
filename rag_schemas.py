@@ -16,6 +16,15 @@ class RAGSource(BaseModel):
     reason_used: str
 
 
+class ChatAssistantRAGResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    status: str
+    answer: str
+    warnings: List[str] = Field(default_factory=list)
+    sources: List[RAGSource] = Field(default_factory=list)
+
+
 class TrainingExerciseRAGItem(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -166,6 +175,36 @@ def _source_schema(source_table: str) -> Dict[str, Any]:
         },
         required=["source_id", "source_table", "source_name", "reason_used"],
         propertyOrdering=["source_id", "source_table", "source_name", "score", "reason_used"],
+    )
+
+
+def _chat_source_schema() -> Dict[str, Any]:
+    return _schema_type(
+        "OBJECT",
+        properties={
+            "source_id": _schema_type("INTEGER"),
+            "source_table": _schema_type("STRING", description="Use 'exercises' or 'foods'."),
+            "source_name": _schema_type("STRING"),
+            "score": _schema_type("NUMBER"),
+            "reason_used": _schema_type("STRING"),
+        },
+        required=["source_id", "source_table", "source_name", "reason_used"],
+        propertyOrdering=["source_id", "source_table", "source_name", "score", "reason_used"],
+    )
+
+
+def chat_assistant_response_schema() -> Dict[str, Any]:
+    """Gemini-compatible schema for FitMind Assistant chat responses."""
+    return _schema_type(
+        "OBJECT",
+        properties={
+            "status": _schema_type("STRING", description="Use 'success'."),
+            "answer": _schema_type("STRING"),
+            "warnings": _schema_type("ARRAY", items=_schema_type("STRING")),
+            "sources": _schema_type("ARRAY", items=_chat_source_schema()),
+        },
+        required=["status", "answer", "warnings", "sources"],
+        propertyOrdering=["status", "answer", "warnings", "sources"],
     )
 
 

@@ -3,6 +3,7 @@ import re
 from typing import Any, Dict
 
 from rag_schemas import (
+    ChatAssistantRAGResponse,
     ModifiedNutritionPlanRAGResponse,
     ModifiedTrainingPlanRAGResponse,
     NutritionPlanRAGResponse,
@@ -49,6 +50,11 @@ def extract_json_object(text: str) -> dict:
 def parse_training_plan_response(text: str) -> TrainingPlanRAGResponse:
     data = extract_json_object(text)
     return TrainingPlanRAGResponse.model_validate(data)
+
+
+def parse_chat_assistant_response(text: str) -> ChatAssistantRAGResponse:
+    data = extract_json_object(text)
+    return ChatAssistantRAGResponse.model_validate(data)
 
 
 def normalize_training_exercise_source_ids(data: Dict[str, Any], plan_key: str = "days") -> Dict[str, Any]:
