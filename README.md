@@ -319,8 +319,7 @@ FitMind AI Service is part of the FitMind graduation project, an AI-powered gym 
 
 ## Authors
 
-FitMind graduation project team.
+- mahmoud yaseen
+- ayham fuqha
 
-## License
 
-License not specified. Add a project license before public distribution.
